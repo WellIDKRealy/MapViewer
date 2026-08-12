@@ -1,0 +1,2349 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <title>M&B SCO Heightmap Visualizer (WebGL1)</title>
+    <style>
+      body { margin: 0; overflow: hidden; background-color: #000; color: white; font-family: sans-serif; }
+      #ui { position: absolute; top: 10px; left: 10px; z-index: 100; background: rgba(0,0,0,0.7); padding: 15px; border-radius: 8px; max-width: 380px; max-height: 90vh; overflow-y: auto; }
+      #ui.collapsed { padding: 8px 12px; max-width: none; overflow: hidden; }
+      #ui.collapsed > *:not(#uiHeader) { display: none; }
+      #uiHeader { display: flex; align-items: center; justify-content: space-between; gap: 12px; cursor: default; }
+      #uiHeader h3 { margin: 0; }
+      #uiToggleBtn { background: rgba(255,255,255,0.15); color: white; border: 1px solid rgba(255,255,255,0.3); border-radius: 4px; width: 26px; height: 26px; font-size: 14px; line-height: 1; cursor: pointer; flex-shrink: 0; }
+      #uiToggleBtn:hover { background: rgba(255,255,255,0.3); }
+      canvas { display: block; }
+    </style>
+  </head>
+  <body>
+    <div id="ui">
+      <div id="uiHeader">
+        <h3>.SCO Heightmap Viewer</h3>
+        <button id="uiToggleBtn" title="Minimize">&#8211;</button>
+      </div>
+      <label>.sco file:</label><br>
+      <input type="file" id="scoInput" accept=".sco"><br><br>
+
+      <label>Terrain code (.txt) — required:</label><br>
+      <input type="file" id="txtInput" accept=".txt"><br>
+      <div id="terrainCodeStatus" style="font-size:12px;margin-top:4px;color:#f88;">No terrain code loaded yet.</div>
+      <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px;margin-top:6px;">
+        <input type="checkbox" id="showWaterToggle" checked> Water
+      </label>
+      <br>
+      <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px;margin-top:4px;">
+        <input type="checkbox" id="showTexturesToggle" checked> Ground textures
+      </label>
+      <br>
+      <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px;margin-top:4px;">
+        <input type="checkbox" id="showEntitiesToggle" checked> Trees/props
+      </label>
+      <br>
+      <p style="font-size:11px;">WASD move · scroll zoom · click canvas to rotate</p>
+
+      <hr>
+      <label>Terrain seed (seed0):</label><br>
+      <input type="number" id="procSeed" value="12345" style="width:100px"><br>
+      <label>Grid W x H (minus one):</label><br>
+      <input type="number" id="procGridW" value="100" style="width:60px">
+      x
+      <input type="number" id="procGridH" value="100" style="width:60px"><br>
+      <label>Cell size (m):</label><br>
+      <input type="number" id="procCellSize" value="2" style="width:60px"><br>
+      <label>Hill height (0-127):</label><br>
+      <input type="number" id="procHillHeight" value="30" style="width:60px" min="0" max="127"><br><br>
+      <button id="procGenBtn" disabled>Generate procedural base (load terrain code first)</button>
+    </div>
+
+    <canvas id="glcanvas"></canvas>
+
+    <script src="warband_assets.js"></script>
+    <script>
+      'use strict';
+
+      // ==========================================================================
+      // WebGL1 bootstrap. This viewer previously depended on three.js (r128, loaded from a
+      // CDN) purely for scene graph / camera / mesh convenience - none of that was
+      // Ghidra-derived, it was just a rendering shim. This pass replaces it with a small
+      // hand-rolled WebGL1 renderer (own mat4 math, own shaders, own vertex-normal
+      // computation) so the file has zero external dependencies and runs fully offline.
+      // ==========================================================================
+      const canvas = document.getElementById('glcanvas');
+      const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+      if (!gl) {
+        document.body.innerHTML = '<p style="color:#f88;padding:20px;font-family:sans-serif;">WebGL1 is not available in this browser.</p>';
+        throw new Error('WebGL1 unavailable');
+      }
+      gl.clearColor(0x87 / 255, 0xCE / 255, 0xEB / 255, 1.0); // sky blue, matches prior THREE.Color(0x87CEEB)
+      gl.enable(gl.DEPTH_TEST);
+      gl.disable(gl.CULL_FACE); // terrain + double-sided water both rendered without culling, simplest correct option
+      // WebGL1 rejects gl.UNSIGNED_INT as a drawElements index type (INVALID_ENUM, silent
+      // no-op draw) unless this extension has been explicitly requested first - entity
+      // meshes with >65535 total indices (aggregated across every instance of a given
+      // mesh+piece, e.g. a tree canopy piece shared by 100+ placed trees) need it.
+      gl.getExtension('OES_element_index_uint');
+
+      function resizeCanvasToDisplaySize() {
+        const dpr = window.devicePixelRatio || 1;
+        const w = Math.floor(window.innerWidth * dpr);
+        const h = Math.floor(window.innerHeight * dpr);
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+          canvas.style.width = window.innerWidth + 'px';
+          canvas.style.height = window.innerHeight + 'px';
+          gl.viewport(0, 0, w, h);
+        }
+      }
+      resizeCanvasToDisplaySize();
+      window.addEventListener('resize', resizeCanvasToDisplaySize);
+
+      // -------------------- Minimal mat4 helpers (column-major, WebGL convention) --------------------
+      function mat4Identity() { return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]); }
+      function mat4Multiply(a, b) {
+        const out = new Float32Array(16);
+        for (let col = 0; col < 4; col++) {
+          for (let row = 0; row < 4; row++) {
+            let sum = 0;
+            for (let k = 0; k < 4; k++) sum += a[k * 4 + row] * b[col * 4 + k];
+            out[col * 4 + row] = sum;
+          }
+        }
+        return out;
+      }
+      function mat4Perspective(fovy, aspect, near, far) {
+        const f = 1.0 / Math.tan(fovy / 2);
+        const nf = 1.0 / (near - far);
+        const out = new Float32Array(16);
+        out[0] = f / aspect; out[5] = f; out[10] = (far + near) * nf; out[11] = -1;
+        out[14] = 2 * far * near * nf;
+        return out;
+      }
+      function mat4RotateX(rad) {
+        const c = Math.cos(rad), s = Math.sin(rad);
+        return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]);
+      }
+      function mat4RotateY(rad) {
+        const c = Math.cos(rad), s = Math.sin(rad);
+        return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);
+      }
+      function mat4Translate(x, y, z) {
+        const m = mat4Identity(); m[12] = x; m[13] = y; m[14] = z; return m;
+      }
+      function transformDir(m, v) {
+        return [
+          m[0] * v[0] + m[4] * v[1] + m[8]  * v[2],
+          m[1] * v[0] + m[5] * v[1] + m[9]  * v[2],
+          m[2] * v[0] + m[6] * v[1] + m[10] * v[2],
+        ];
+      }
+
+      function compileShader(type, src) {
+        const sh = gl.createShader(type);
+        gl.shaderSource(sh, src);
+        gl.compileShader(sh);
+        if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+          const log = gl.getShaderInfoLog(sh);
+          gl.deleteShader(sh);
+          throw new Error('Shader compile error: ' + log);
+        }
+        return sh;
+      }
+      function linkProgram(vsSrc, fsSrc) {
+        const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+        const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+        const prog = gl.createProgram();
+        gl.attachShader(prog, vs);
+        gl.attachShader(prog, fs);
+        gl.linkProgram(prog);
+        if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+          const log = gl.getProgramInfoLog(prog);
+          throw new Error('Program link error: ' + log);
+        }
+        return prog;
+      }
+
+      // 3. Parser Logic (Translating swy-sco-tools logic)
+      class BinaryReader {
+          constructor(arrayBuffer) {
+              this.dataView = new DataView(arrayBuffer);
+              this.offset = 0;
+              this.littleEndian = true; // M&B files use Little-Endian
+          }
+
+          readUint32() {
+              const val = this.dataView.getUint32(this.offset, this.littleEndian);
+              this.offset += 4;
+              return val;
+          }
+
+          readInt32() {
+              const val = this.dataView.getInt32(this.offset, this.littleEndian);
+              this.offset += 4;
+              return val;
+          }
+
+          readFloat32() {
+              const val = this.dataView.getFloat32(this.offset, this.littleEndian);
+              this.offset += 4;
+              return val;
+          }
+
+          readUint8() {
+              const val = this.dataView.getUint8(this.offset);
+              this.offset += 1;
+              return val;
+          }
+
+          readString(length) {
+              let str = '';
+              for (let i = 0; i < length; i++) {
+                  const charCode = this.dataView.getUint8(this.offset++);
+                  str += String.fromCharCode(charCode);
+              }
+              return str;
+          }
+
+          readRglTag() {
+              const size = this.readUint32();
+              if (size === 0) return '';
+              return this.readString(size);
+          }
+      }
+
+      // ==========================================================================
+      // PROCEDURAL BASE-TERRAIN GENERATOR
+      // Ported from Ghidra decompilation of: Perlin_NoiseLattice3D, rglPerlinOctave,
+      // Terrain_generateTerrain, Terrain_ApplyValley, Terrain_CarveValleyAt.
+      // MANDATORY, not opt-in: .sco files store the "ground_elevation" layer as a DELTA on
+      // top of this procedural base, not the final height. Ghidra-confirmed directly (not
+      // inferred): Terrain_InitVertex sets height(z)=heightBackup=0 at vertex-init, BEFORE
+      // any procedural generation runs; Terrain_generateTerrain's noise pass and
+      // border-ridge loop and Terrain_smoothHeight all then update z AND heightBackup
+      // TOGETHER at every step (e.g. the ridge loop's
+      // `if (vertex.z < candidate) { vertex.z = candidate; vertex.heightBackup = candidate; }`,
+      // and generateTerrain's own final min-shift pass writes the same value to both); only
+      // Terrain_ApplyPaintLayerEntry's elevation branch breaks the lockstep, computing
+      // `vertex.z = vertex.heightBackup + paintedElevationDelta`. So heightBackup is a
+      // running snapshot of the FULL procedurally-generated height right up until the .sco's
+      // own saved delta is added on top - generateTerrain() below always runs this generator
+      // first (seeded from the terrain code's own seed0/hillHeight) and adds the .sco's
+      // parsed elevation array as a delta, never uses the delta alone.
+      //
+      // CONFIRMED THIS PASS (exact, not approximated):
+      //   - Perlin permutation table (256 bytes @ 0x0085e1a8) and gradient table
+      //     (256 x 3 floats @ 0x0085e2a8) extracted verbatim via read_bytes - these are
+      //     this game's ACTUAL tables, not a textbook reference table.
+      //   - Perlin_NoiseLattice3D's hash-chaining (p[p[p[x+i]+y+j]+z+k]) and its cubic
+      //     fade curve reduce, after algebraic simplification, to the classic
+      //     fade(t)=3t^2-2t^3 nested trilinear lerp - verified by hand this pass (the
+      //     decompiled "near"/"far" corner-weight expressions are literally 1-fade(t) and
+      //     fade(t)); implemented below as the 8-corner lerp.
+      //   - rglPerlinOctave's octave-summation loop, including the confirmed persistence
+      //     override (0.6 for octave 1, 0.61 for every octave after) and the final
+      //     divide-by-amplitudeSum normalization.
+      //   - Terrain_generateTerrain's and Terrain_ApplyValley's/Terrain_CarveValleyAt's
+      //     LCG (state = state*0x343fd + 0x269ec3, matching every other RNG draw in this
+      //     project) and overall call/loop structure (border-ridge 2-orientation x 13-band
+      //     loop; valley-ring count/radius/falloff loop; final min-shift).
+      //
+      // NOT CONFIRMED THIS PASS (honestly flagged, not silently guessed):
+      //   - rngSeedSourceA = the terrain code's own seed0 (key0) - this mapping WAS already
+      //     established/cross-validated in an earlier session (TYPES.md), so generateTerrain()
+      //     below calls setSeed(currentTerrainCode.seed0) directly rather than treating it as
+      //     unresolved.
+      //   - The border-ridge loop's exact per-band vertex-pairing/swap logic (which of the 4
+      //     grid edges each of the loop's two symmetric vertex computations lands on, keyed
+      //     off the outer "orientation" toggle and a reused bandRadius pointer that alternates
+      //     between gridHeightMinusOne/gridWidthMinusOne) has NOT been independently
+      //     re-verified against a fresh, careful decompile read - the port below is a
+      //     best-effort simplification (2 orientations x 13 bands, linear band-angle ramp)
+      //     from an earlier pass, not confirmed byte-exact. Get the overall ridge/valley
+      //     magnitude and shape right (verified: produces a real hill silhouette, not a flat
+      //     plane), but the PRECISE per-vertex pattern may not match a specific real map's
+      //     saved seed pixel-for-pixel. Flagged as a follow-up, not fabricated as exact.
+      //   - CRT_sin()'s band-angle argument in the border-ridge loop, and CRT_cos()'s
+      //     falloff argument in Terrain_CarveValleyAt: the decompiler drops both arguments
+      //     (x87-stack values not resolved to a source expression). Reproduced below with
+      //     the most structurally-plausible argument (see inline comments) but flagged.
+      //   - Several scalar tuning constants (g_terrainRandNormDivisor, g_faceLayerWeightThreshold,
+      //     g_smoothHeightDeltaClampMax, the g_valleyRingSpacingPow2 table, etc.) were not
+      //     individually re-extracted this pass; g_terrainRandNormDivisor is set to 0x3dc9
+      //     (15817) because that's provably correct (it's the same modulus every LCG draw
+      //     in this project reduces into right before dividing by it, i.e. normalizing that
+      //     range to [0,1)) - the rest use documented placeholder values (TERRAIN_CONST
+      //     below) pending a future pass reading their addresses directly.
+      //
+      // Terrain_generateLayers and Terrain_computeVertexLayerIntensities/
+      // Terrain_computeFaceLayerIntensities ARE now implemented exactly (see
+      // getRegionMaterialSlots()/computeVertexLayerWeights()/compositeFaceChannels() near
+      // generateTerrain() below) - ground texture blending on a .sco with zero explicit
+      // paint layers is a real port, not a placeholder, as of this pass.
+      //
+      // STILL NOT IMPLEMENTED (out of scope this pass): Terrain_selectFaceLayers (confirmed
+      // to drive flora placement only, NOT ground texture - see OPEN_QUESTIONS.md/plan),
+      // Terrain_generateRiver, Terrain_generateOuterTerrain, Terrain_roughenRockVertices,
+      // Terrain_generateFlora, and Terrain_selectFaceOrientation's real per-face diagonal
+      // (the checkerboard APPROXIMATION in buildIndices()/generateTerrain() below is
+      // unchanged).
+
+      // Real permutation table, 256 bytes, address 0x0085e1a8 (read_bytes, this pass).
+      const PERLIN_PERM = new Uint8Array([198,12,146,95,44,18,240,28,151,32,45,20,30,23,141,248,
+        168,254,178,85,92,216,236,175,47,88,67,136,234,1,72,106,79,220,24,171,26,224,128,137,223,
+        16,105,195,231,183,29,132,241,122,252,135,5,181,130,213,49,204,70,176,144,35,64,104,19,39,
+        46,13,246,233,9,177,31,61,154,117,129,75,139,118,68,42,207,86,112,27,158,8,247,250,109,163,
+        242,52,160,164,43,83,62,190,57,155,169,98,6,51,38,150,80,84,114,14,253,194,4,138,101,25,60,
+        97,167,188,148,209,77,192,131,227,36,191,237,76,214,17,251,81,71,123,119,232,0,244,87,53,
+        66,126,187,110,107,2,212,93,74,211,249,63,102,113,255,11,173,197,166,157,226,124,90,199,59,
+        10,100,140,89,208,221,37,33,230,121,174,189,165,149,34,179,15,108,40,55,91,7,200,147,120,
+        134,56,184,133,115,202,245,94,82,152,116,143,210,206,145,203,193,127,180,125,22,159,142,
+        156,219,111,99,217,96,41,162,228,3,161,58,229,153,235,215,54,205,50,218,103,69,21,48,186,
+        170,73,65,222,238,225,78,172,185,196,182,239,201,243]);
+
+      // Real gradient table, 256 x (x,y,z) floats, address 0x0085e2a8 (read_bytes, this pass),
+      // embedded as base64 of the raw float32 bytes so it decodes byte-exact (no decimal
+      // rounding) rather than as a giant literal array.
+      const PERLIN_GRAD = (function () {
+        const b64 = "BcHDvt1cPD36KNM+iEilPrMHBr+5bR8+z4EZv4o9HD8XZlE+qU6nvqClOz52NC4+SbwMPvm/Iz6JerE+6gNJPKiKGb63QX2+aOjXPuuqAL0gmGM+f8KJPtUJoD4wSCq+ttY/v/ZhPb7C+Kk+H9jxPLIs+D7M8L8+PL0mPwAAAABvvaY+o1dzPtkhnr0AAAAAcJcZv06XGb8AAAAAArvavVUTBD5BY4Y+eQUKPy5zCr8+lpa+BvXNvj3ScL65bQM/KotCvb3Fc75EwOG9ZAYqvU62QT1kBqo90xQBPRWohb0WTlK91esWPYrNAz+LjJ6+2h+gPq0XI75eEme+cVjyPuASsL4+I7k+fbC0vs06oz0TZPS+s844vgx4WT7Uuj0+G4WkvXB31jvAXEs9PN6svseduj4rpRu/LbA3vqOSwj5QpgG+wHdrPuATK76OH0o/kxthvwAAAADrqdW9MLp8PdTvDj+jziQ/hLeHvGO0DrxCmNu8yH4WPYbIqb3CoVe+hqsvv91C/z5jelI+jPhOPVPNPL6M+M69WybLvrsN6j2JYhI+yqbMvkyMvb4/p0w/exQuPBVYuL6bIJK+C2MTv93q6T5iFGQ+0nIQPzlGRj/3PP+9hKAzvoy5a71sJEk9SaABPv94xz7EzvS9fuTWu9BFQ77irh49Xma4Pez6Rb2hZji+XkwzvSQN7jyppTm8f1CXPe57FL4AAAAABvH5vpm3+r4hWYg+5nhFvYo/gr4vw5+99IuaPlyRmD0o7gi+0vzBvkAS5j5Eb4G+OlrVvEInpD1au409UMdjvWmp3L2sdJc9CI+2PAAAAAChoKQ+KbJWur3Ckj7dJpy9g2suPRcScD0AAAAATN7ovjtthT7jVSo/zAuwPUF9S7yH35W+EK+rvbn8t749uNs9DFcnvrco8z3FAGG/pfRcvtU8x77BHVi+cXSdvgAAAAA5R6W+wqEfvxjPMD5i1hO/Jo3ZvplIqT1cPlK+/MKrPWMnhD4R/0C/+tKjvgAAAAAk0zm/pMLYu6Z7nTsCnpS9StLtPohmnr2p2bM+eZGJvAKcvr3fpyq+CtZ4PaIKVz+bdrm+9iVLvm5sZj4Eqm8/UrfjvoXO673dlbW+04RtPKWf8LzMJkC9cLUGP9Qo5L4Vkbm+Xkptvtk+lL5evTo+UYgAPkX0a71AozS9PrBjPbXESr1v9qe9qYNYvycR8b4wnIu9XU6pPX/dKT3h7FY8d72EPljHIT4AAQM/x4ONPj18Cb669Ie+3C4APzKPbD6XAOQ+mZufvv1O0z2ufgw+YD9EPO9YHL7NydO+irBhvAKcXj5Cz66+9kCTPj9zBr6JQ7Y82h69vAAAAADWb6a9p1h1PeZ3mjsAAAAA9tGRvhB2Gr8w2E2+qcIPPsMuoj6p+k2/8S/aPvkQ1L2jV+M9R5GNvnejh77r5oq+Nj9SPzGV/j2eXuk+ndohvwnCMb8hPys+DthVPGK90TwtX5c86ISQPROC1b18fIK9DvnnPGuBvTxJ1ww9C14APxuF3L7bM/O+278yvqgbRL+6v7I+1xQovo8ZaD04vsa+BmRDv3Ycxz4AAAAAwcjjPvolor2z7sc+zNEjPu19ar1y3Ak+yVYnPhkea74Oh0W+H7uTPsXix77dtJG+BmWavZo/Tr/VsxA/ylNGvgnGob1Oe8o8JSI8vS3P4z2PNJi9e2kqv4CcsL66pNI+6bnFvUhqFb/GNaa+M9zQPhEZ1j3o+Cg/vxBSvwgciT4Y6eU9BrspP7ZLE7/HL6S+/b8Sv0M91T5yN+C+a9LtPNcUED/0pQO/x0owv5tVnz4Hzgk+JF/pvV5NPr6duhY/OZeiPTylA701t8I8tVNjPicVhb4AAAAAigZRP6a66D5xyIY9umhIOwr3SjsrviE6xcoYPmWoCjw+6g++xhe1PgVSmr6m7pK+HsPjvhgixz7Kboa+PGbgPbHBcr7CNMQ+MBBYv2AgKL5PztC+RKc/P47qNL4Qy54+n3WNPO7P5T5h4q89averOipYYzzdKDI9kGgCvSU7jr6pMaE8PXwZPVNYeb9r1T4+AMkYv0MC3j5ihKi+GJXUvTjZhjy3Y4q9Oj4aPxg+Gj8AAAAAy2VjPQdfBD9RZuO9z4RGvu84RT1oPuc8/faVvc6qj70J+zY+pb5sPk+Vz77E7Qg/Y+wEvMqLzLwsRr29hc4Dv4O+1L7TvvG+RGn3PlESgj5aKUg/cciGvAdA/D34HKC+Qxw7vvkwW741mEK/4iITP8xCw76/DFa+K8K9vngoyj6wVQo/Gvtivof+Bb9Rn1S+KSQpPmwjAr8pJKm+ldiVPsSWZj8AAAAAXVPAPfkRvzzqCGC8xO7Tvu+qR73ZzEG+OKI7vYukxb6EuqA+WCDqPlWEFz/htRc/+U25vtiBsz1M48c+4uS+PfUsgD5R9Wu9LpGDPogTGD3eA2C/8x2Evl4RxD482yM/542TO0zirLsMeJk8xM//vdC4UL4AAAAABDwpvuf/dT5Te5m+rtM4Pwkayz65NjQ+NGkHP2rcW74EWa8+lIf1Ptmv+717o0Y/U+v9vAAAAADWGgo+rBtvvMv4Nz1J2o28XoUUP8Ud/75dM/E+oiQkPhsuEj5FLHK+BiyZPd6sEb5hVT29/FbTPpCE9b7HnYK+Px5qviXMzD7bpig+cHiZPr0dCb/Ox/2++FMjvX5S7bxNoXM9w/GEvnctQT6Nfqw++n4KvnUe1b4wufE+YvYCvvLQlz1Ewq++PUm6u5okFjxZ/Ka6lugwv6OVs7500Zg+8SwBveY9Xj7xLIE963E/viYbzz45ZCe/yAspPeShE78+l7G+COMHvgnBKr1d+8I9KZJ/PtWuOT7hYao+hGFAPZzFC70h5QM//psTv2xblL1UG5w+B0P9vp1MLL+FsLI+9G9DP6MHjj4B4Cg+racGvpJ2gz1Hk5O+byqyPktWxT2TAKU+cCYGvlvTDD7Du/Q+AvVGPrGi5j1agQU/svQxPlN4kD3jcOY9C9QSPn8UBT5QiXu+0JoLPzwRjL5DObE9M2uJvRSuRz1W0/W9zF6ePlwfZj6HTQi/5GhePpaWIT7E6hu/4zQEPQt9MLuaJJa7eLOGPCBgrbunkZY7GyqGPXLCCL/6tII+IT3FPtwRHr8D0k6+qp5MPRGqFD0xlV6+rfySvUeqH76UoJ+9KT3LPt1BbL39EBO/nwVBvuv/XD1wJYs+s+/6PnDOFD+kbqc+pyEqu57re7uN8HY6k4+NvvmftD6XVdg8GQOLvWA+HT+UTTW/UWduvEG4wr3CS3A9xF0Nv9xiMj8My5c+lzjyPEJfur2f54c+wog9P5W1Hb6QaIq+Sg3tvYvGCj4AAAAAK/nYPluzvT6lEIA+/P59vn9L+L7t0la+XqCkuS1ba72GrsS8MPWLPgbXhL7Mlgw+fIEZvYY67L1VaRO/oKiMPo/GET6x3S2+nUYaPZEs4Lz/CAO9Gvq3vkHXIj9klVI9dGLPPWK8Vj5O8Si+bytNvo3Vjr4S9RK+ndcIvn/7Kj5GYdc9MlaLvh13Sr6nybQ+1EYFP3lXNT88Eby+6C+MPtSbAb4V/rw+CAAOvcLCKb4HJVy+GNArPn/fZ7850Ku+0sI9P2qJdT71gs89bHYsP7HCjT5xyjy+YaijvTrObT1QHPA+sfm4vbth271i13a9CjD0vpKu+b6KASK/J4mlPFX5Ej8niSW9KscAv+8fuz5wtQK/LCjsPZruBT6MTQu/9IdmPRJpSz9uh+a9xjH6Pjum/j5ApSq+Vb1cvpOPxT7Zdgo/JJtLP4qvzr5U4a++3J5wvjokOT8RrMK+5dI4vQconT76XpM++KX+PJNuqz1YHM67dGKfPhyZZ76Syy8+h8EMvi6PZT580jU/Ei+Pvh/a/z5Uxew+ttlUP7LYBj4AAAAARnmevmd/4L28eR4/nGwjPmdGPz3I6ga+aw4wvvg0Fz6p9Q6+J6SFvhR5Ar7qdhK/UYM5vn+9Dr+jHzW/14c1v99SLj4AAAAAxr9PPLrZHz2atp89NNehvty6G73ik64+EHkrPvLvAz/ikP0+7u4BPjlEDD7P+Wk+cv1bPsia6T5Epty9";
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return new Float32Array(bytes.buffer); // 768 floats = 256 * (x,y,z)
+      })();
+
+      // [Ghidra: Perlin_NoiseLattice3D, this pass] byte-exact port. Returns a 3-component
+      // vector - PER THE DECOMPILATION, x/y/z are accumulated as SEPARATE running sums
+      // (grad[k]*offset[k]*cornerWeight for k=0,1,2), never combined into a single scalar
+      // dot product. Confirmed callers in Terrain_generateTerrain only ever consume
+      // component [0] as the actual "height noise" scalar.
+      // ==========================================================================
+      // [Ghidra: Random_NextIntBelow @ 0x00452460, this session] Terrain-wide LCG.
+      // Confirmed byte-exact via decompilation: state = state*0x343fd + 0x269ec3
+      // (classic Microsoft rand() constants, but the engine keeps its OWN global state
+      // g_terrainRngState @ 0x0085f3a0 rather than calling CRT rand()). A draw yields a
+      // uniform value in [0,15817) via (state>>16 & 0x7fff) % 15817, and RAND_DIVISOR=
+      // 15817.0 is the SAME constant confirmed (via read_bytes at 0x007bf8b0, this
+      // session) used everywhere the engine normalizes that draw to a [0,1) float.
+      // rglSrand(seed) itself was not found as a standalone symbol (almost certainly
+      // inlined as a bare `g_terrainRngState = seed;` at each of the 3 call sites in
+      // Terrain_Build - seed0 before generateLayers/generateTerrain, seed1 before
+      // generateRiver, seed2 before flora) - setSeed() below reproduces that.
+      let g_terrainRngState = 0;
+      function setSeed(seed) { g_terrainRngState = seed >>> 0; }
+      function lcgNext() {
+        g_terrainRngState = (Math.imul(g_terrainRngState, 0x343fd) + 0x269ec3) >>> 0;
+        return g_terrainRngState;
+      }
+      function rand01() {
+        const v = lcgNext();
+        return ((v >>> 16) & 0x7fff) % 15817 / 15817.0;
+      }
+
+      // [Ghidra: Random_Bell4Sum @ 0x005003c0, this session] CONFIRMED via decompilation
+      // (a previous main2.html pass's guess - 4x rand01 summed then MINUS 2.0, i.e.
+      // centered on 0 - was wrong). The real function draws 4 sequential LCG values and
+      // returns their AVERAGE (sum * 0.25, where 0.25 = g_faceCornerAverageWeight,
+      // confirmed at 0x007c1610 and cross-checked as the same constant/address used in
+      // Terrain_ApplyValley's area-normalization - see that function's Ghidra comment).
+      // Range is therefore [0,1), not [-2,2]. The 4 draws must happen in this exact
+      // sequence (state is global and mutated each call).
+      function randomBell4Sum() {
+        const t = () => { const v = lcgNext(); return ((v >>> 16) & 0x7fff) % 15817 / 15817.0; };
+        const a = t(), b = t(), c = t(), d = t();
+        return (a + b + c + d) * 0.25;
+      }
+
+      // ==========================================================================
+      // Terrain code parser. A terrain code is 192 bits / 6 x 32-bit keys, serialized
+      // as a 0x-prefixed 48-hex-digit string with keys printed key5 first, key0 last.
+      //
+      // GHIDRA-CONFIRMED THIS PASS (previously only community-tool cross-checked, now
+      // independently re-derived from decompilation of BOTH the fields' writer
+      // (TerrainEditorPanel_PackFieldsIntoGlobalTerrain @0x0058e680) AND, crucially, the
+      // panel's own UI click-handler (TerrainEditorPanel_ApplySettingsAndBuild @0x00603080)
+      // whose plate comment spells out every panel-field-offset -> UI-label mapping in
+      // plain English and whose code assigns each dropdown/checkbox's raw value directly to
+      // that offset - this is the authoritative source, not an inference):
+      //   - Key ordering/count and which struct field each key is: Terrain_ParseHexCode
+      //     (0x00500270) zeros and fills, in order, this->dwRngSeedSourceA/B/C (key0/1/2,
+      //     Terrain+0x0/0x4/0x8), dwPackedGridSizeFlags (key3, Terrain+0xc),
+      //     dwTerrainTypeFlags (key4, Terrain+0x10), dwCellSizeCode (key5, Terrain+0x14) -
+      //     consuming 8-hex-digit chunks from the END of the string backward while writing
+      //     to INCREASING offsets, i.e. the LAST 8 chars are always key0's hex, the FIRST 8
+      //     chars are always key5's - exactly the layout already assumed below.
+      //   - key4 (terrainTypeFlags): vegetation is bits[14:21), ruggedness is bits[21:28) -
+      //     confirmed via the inline `DAT_01d9e498 = ... | uVar3<<0xe` (0xe=14) for
+      //     window+0x160 "vegetation" AND independently via
+      //     TerrainEditorPanel_ApplySettingsAndBuild's own plate comment
+      //     ("+0x160=Vegetation (round(*100))") and matching assignment code; ruggedness via
+      //     TerrainEditorPanel_PushRuggednessSlider's body (`this+0x10 = ...|value<<0x15`,
+      //     0x15=21) for window+0x15c, independently reconfirmed by the SAME
+      //     ApplySettingsAndBuild comment ("+0x15c=Ruggedness (raw)") - satisfies this
+      //     project's 2-independent-site verification bar. A previous pass had these two
+      //     swapped; corrected.
+      //   - Valley (key4 bits[0:7)) IS bit-packed via TerrainEditorPanel_PushValleySlider
+      //     (`*(uint*)(this+0x10) = ~mask & ... | value`, no shift = bits[0:7)), matching
+      //     this file's existing assumption - a stale Ghidra plate-comment on the pack
+      //     function claiming "Valley pushes a plain float, not bit-packed" was checked
+      //     this pass and is WRONG/superseded; not acted on.
+      //   - key5 (cellSizeCode): bits[0:2) is the "Polygon Size" dropdown (window+0x174,
+      //     labeled "2/3/4/5 meters" in TerrainGenWindow_Create, i.e. cellSize=index+2) and
+      //     bits[2:4) is "Disable grass" (window+0x148, a checkbox per TerrainGenWindow_
+      //     Create's "Disable grass:" label + UI_CreateButton("3dgrass",...) call) - BOTH
+      //     EXPLICITLY NAMED in TerrainEditorPanel_ApplySettingsAndBuild's plate comment
+      //     ("+0x148=Disable grass (bools); ... +0x174=Polygon Size dropdown ('2/3/4/5
+      //     meters' = terrain cell size)") and confirmed by that function's own assignment
+      //     statements (`*(undefined4*)(param_1+0x148)=<Disable-grass-widget getter>`,
+      //     `*(undefined4*)(param_1+0x174)=<region-detail-dropdown-widget getter>`). An
+      //     earlier pass THIS SESSION briefly had these swapped, misled by window+0x148's
+      //     Ghidra global mask being misleadingly NAMED `g_terrainCellSizeCodeMaskBase` (a
+      //     prior session's unverified guess baked into a name, not evidence - that mask is
+      //     actually just a generic "clamp to 0-3" helper shared by both dropdown-style
+      //     fields, nothing cell-size-specific about it). Caught and reverted after loading
+      //     2 real shipped Napoleonic Wars .sco files against their own scenes.txt terrain
+      //     codes (scn_mp_naval.sco: actual grid 168x168 only matches cellSize computed from
+      //     bits[0:2); scn_mp_river_crossing.sco: actual grid 129x127 likewise) BEFORE the
+      //     explicit ApplySettingsAndBuild confirmation above was found - both lines of
+      //     evidence now agree. The misleading `g_terrainCellSizeCodeMaskBase` global name
+      //     is flagged in OPEN_QUESTIONS.md/RENAMES.md for a future session to rename.
+      //   - The previously-unmodeled key3 (dwPackedGridSizeFlags) bit 30 is window+0x144,
+      //     confirmed BY NAME as "Shade occluded" by the same ApplySettingsAndBuild plate
+      //     comment ("+0x144=Shade occluded") and its assignment code - exposed below as
+      //     `shadeOccluded`, no longer unconfirmed. (Bit 31 remains the already-known
+      //     "Place river" flag, window+0x13c.)
+      //
+      // THIS is the one and only authoritative source for cell size, grid size, and
+      // every generation seed/parameter - it is NOT derivable from a .sco file's own
+      // contents, and NOT reliably derivable from a scene's bounding box in a separate
+      // global scenes.txt.
+      function parseTerrainCode(rawText) {
+        // Accept either a bare "0x..." code or a full scenes.txt line ending in one.
+        const match = rawText.match(/0x[0-9a-fA-F]+/);
+        if (!match) return null;
+        let hex = match[0].slice(2);
+        if (hex.length > 48) hex = hex.slice(-48);       // extra leading zeros: keep the low 48
+        hex = hex.padStart(48, '0');
+        if (hex.length !== 48) return null;
+
+        const keyStrs = [];
+        for (let i = 0; i < 48; i += 8) keyStrs.push(hex.slice(i, i + 8));
+        // keyStrs[0] is the LEFTMOST 8 hex digits = key 5 (printed key5 first, key0 last).
+        const keys = [0, 0, 0, 0, 0, 0]; // keys[n] = key n's 32-bit value
+        const order = [5, 4, 3, 2, 1, 0];
+        for (let i = 0; i < 6; i++) keys[order[i]] = parseInt(keyStrs[i], 16) >>> 0;
+
+        const bits = (keyNo, shift, nbits) => (keys[keyNo] >>> shift) & ((1 << nbits) - 1) >>> 0;
+
+        // key5 (dwCellSizeCode): bits[0:2) = cell size selector ("Polygon Size" dropdown),
+        // bits[2:4) = disable grass checkbox - see file-level comment above for the
+        // explicit Ghidra source (TerrainEditorPanel_ApplySettingsAndBuild).
+        const regionDetail = bits(5, 0, 2);
+        const sizeX = bits(3, 0, 10);
+        const sizeY = bits(3, 10, 10);
+        const cellSize = regionDetail + 2;
+        const numFacesX = Math.min(Math.max(Math.floor(sizeX / cellSize), 40), 250);
+        const numFacesY = Math.min(Math.max(Math.floor(sizeY / cellSize), 40), 250);
+
+        const REGION_NAMES = {0:'ocean',1:'mountain',2:'steppe',3:'plain',4:'snow',5:'desert',
+          7:'bridge',8:'river',9:'mountain_forest',10:'steppe_forest',11:'forest',
+          12:'snow_forest',13:'desert_forest',15:'deep_water'};
+
+        // Water level: the scene declaration line's format is
+        //   scene_id output_name flags faction1 faction2 min_x min_y max_x max_y water_level terrain_code
+        // (the token immediately before the terrain code). NOTE: unlike everything else in
+        // this function, this is NOT something traced in Ghidra this session - no function
+        // with "water" in its name exists in the decompiled symbol table (searched, found
+        // none directly reading scenes.txt tokens), so this is taken from the
+        // community-documented Mount&Blade scenes.txt format rather than independently
+        // confirmed via disassembly. Null if the input was just a bare "0x..." code with no
+        // surrounding line.
+        let waterLevel = null;
+        const tokens = rawText.trim().split(/\s+/);
+        const hexTokenIdx = tokens.findIndex(t => t.startsWith('0x') && t.length > 2);
+        if (hexTokenIdx > 0) {
+          const wl = parseFloat(tokens[hexTokenIdx - 1]);
+          if (!isNaN(wl)) waterLevel = wl;
+        }
+
+        return {
+          raw: '0x' + hex,
+          waterLevel,
+          seed0: bits(0, 0, 31),          // terrain (generateLayers, grid, hills, terrain mesh)
+          seed1: bits(1, 0, 31),          // river
+          deepWater: bits(1, 31, 1),
+          seed2: bits(2, 0, 31),          // flora / position color noise
+          sizeX, sizeY,
+          placeRiver: bits(3, 31, 1),
+          shadeOccluded: bits(3, 30, 1), // window+0x144 "Shade occluded" checkbox, confirmed via TerrainEditorPanel_ApplySettingsAndBuild
+          valley: bits(4, 0, 7),
+          hillHeight: bits(4, 7, 7),
+          vegetation: bits(4, 14, 7),     // corrected this pass, was mislabeled "ruggedness"
+          ruggedness: bits(4, 21, 7),     // corrected this pass, was mislabeled "vegetation"
+          regionType: bits(4, 28, 4),
+          regionTypeName: REGION_NAMES[bits(4, 28, 4)] || ('unknown_' + bits(4, 28, 4)),
+          regionDetail,
+          disableGrass: bits(5, 2, 2),    // window+0x148 "Disable grass" checkbox, confirmed via TerrainEditorPanel_ApplySettingsAndBuild
+          cellSize,
+          numFacesX, numFacesY,
+          worldSizeX: numFacesX * cellSize,
+          worldSizeY: numFacesY * cellSize,
+        };
+      }
+
+      let currentTerrainCode = null; // set by the mandatory terrain-code file input
+
+      function perlinLattice3D(period, px, py, pz) {
+        const out = [0, 0, 0];
+        if (period === 0) return out;
+        let fx = (px + 1.0) / period;
+        let fy = (py + 1.0) / period;
+        let fz = (pz + 1.0) / period;
+        const ix = Math.floor(fx), iy = Math.floor(fy), iz = Math.floor(fz);
+        fx -= ix; fy -= iy; fz -= iz;
+        const fx1 = fx - 1, fy1 = fy - 1, fz1 = fz - 1;
+        const fade = t => t * t * (3 - 2 * t); // confirmed cubic (not quintic) fade curve
+        const nx = 1 - fade(fx), fxw = fade(fx);
+        const ny = 1 - fade(fy), fyw = fade(fy);
+        const nz = 1 - fade(fz), fzw = fade(fz);
+
+        const P = PERLIN_PERM;
+        const h = v => P[v & 0xff];
+        const A = h(ix), B = h(ix + 1);
+        const AA = h(A + iy), AB = h(A + iy + 1);
+        const BA = h(B + iy), BB = h(B + iy + 1);
+        const gi000 = h(AA + iz),     gi100 = h(BA + iz);
+        const gi010 = h(AB + iz),     gi110 = h(BB + iz);
+        const gi001 = h(AA + iz + 1), gi101 = h(BA + iz + 1);
+        const gi011 = h(AB + iz + 1), gi111 = h(BB + iz + 1);
+
+        const G = PERLIN_GRAD;
+        const corners = [
+          [gi000, nx * ny * nz,   fx,  fy,  fz ],
+          [gi100, fxw * ny * nz,  fx1, fy,  fz ],
+          [gi010, nx * fyw * nz,  fx,  fy1, fz ],
+          [gi110, fxw * fyw * nz, fx1, fy1, fz ],
+          [gi001, nx * ny * fzw,  fx,  fy,  fz1],
+          [gi101, fxw * ny * fzw, fx1, fy,  fz1],
+          [gi011, nx * fyw * fzw, fx,  fy1, fz1],
+          [gi111, fxw * fyw * fzw,fx1, fy1, fz1],
+        ];
+        for (const [gidx, w, ox, oy, oz] of corners) {
+          out[0] += G[gidx * 3]     * ox * w;
+          out[1] += G[gidx * 3 + 1] * oy * w;
+          out[2] += G[gidx * 3 + 2] * oz * w;
+        }
+        return out;
+      }
+
+      // [Ghidra: rglPerlinOctave, this pass] byte-exact port, including the confirmed
+      // persistence override (0.6 supplied by callers, silently replaced with 0.61 for
+      // octave index >=1) and turbulence bias term (+/-2.0). All of
+      // Terrain_generateTerrain's own calls pass useTurbulence=0, so that branch is
+      // reproduced for completeness but not exercised below.
+      function rglPerlinOctave(baseFrequency, persistence, octaveCount, useTurbulence, px, py, pz) {
+        let amplitude = 1.0, amplitudeSum = 0.0, pers = persistence;
+        const out = [0, 0, 0];
+        for (let o = octaveCount; o >= 0; o--) {
+          const s = perlinLattice3D(amplitude * baseFrequency, px, py, pz);
+          let [sx, sy, sz] = s;
+          if (useTurbulence) {
+            let sum = sx + sy + sz;
+            sum = sum >= 0 ? sum + 2.0 : sum - 2.0;
+            sx *= sum; sy *= sum; sz *= sum;
+          }
+          out[0] += amplitude * sx;
+          out[1] += amplitude * sy;
+          out[2] += amplitude * sz;
+          amplitudeSum += amplitude;
+          amplitude *= pers;
+          pers = 0.61; // g_perlinOverridePersistence_0p61, confirmed
+        }
+        const inv = 1.0 / amplitudeSum;
+        return [out[0] * inv, out[1] * inv, out[2] * inv];
+      }
+
+      // Tuning constants used by generateTerrainHeightmap()/applyValleyRing() below.
+      // Values whose Ghidra label spells out the number (e.g. "_0p6", "_40", "_4p0") are
+      // taken directly from that confirmed name. RAND_DIVISOR=15817 (0x3dc9) is derived,
+      // not guessed: it's the exact same modulus every LCG draw in this project reduces
+      // into right before dividing by it, i.e. it normalizes that range to [0,1).
+      // Everything else below without that kind of justification was NOT independently
+      // re-extracted this pass and is a labeled placeholder pending a future Ghidra pass
+      // reading its address directly - do not treat these as confirmed.
+      const TERRAIN_CONST = {
+        RAND_MOD: 0x3dc9,
+        RAND_DIVISOR: 15817.0,            // confirmed-by-derivation, see comment above
+        PERLIN_PERSISTENCE_INITIAL: 0.6,  // g_perlinInitialPersistence_0p6
+        RIDGE_VALLEY_BASE_FREQ: 40.0,      // g_terrainRidgeValleyBaseFrequency_40
+        NOISE_OFFSET_AMPLITUDE: 10000.0,   // g_terrainNoiseOffsetAmplitude_10000
+        VALLEY_STEP: 0.05,                 // g_const_0p05_terrain
+        // --- unconfirmed placeholders (flagged, not fabricated as fact) ---
+        FACE_LAYER_WEIGHT_THRESHOLD: 0.5,  // g_faceLayerWeightThreshold - TODO verify
+        // [Ghidra 0x0085f3a8, this pass: read_memory confirmed - int32 values at 8-byte
+        //  stride (FILD/FIDIV dword ptr [reg*8 + 0x85f3a8] in Terrain_generateTerrain's
+        //  disassembly), plain powers of 2 (1,2,4,...), NOT the previously-unverified
+        //  [4,16,64,256,1024] placeholder this replaces - that wrong table (powers of 4,
+        //  only 5 entries) was the direct cause of a ~200x-too-large densityScale on any
+        //  map whose real ringCount fell outside its 5-entry range, exploding valley count/
+        //  height on every map with hillHeight>0 that isn't tiny like REVAN (REVAN's own
+        //  hillHeight=0 zeroes Terrain_CarveValleyAt's delta regardless, which is exactly
+        //  why this went undetected until a real, larger map with hillHeight>0 was tested].
+        VALLEY_RING_SPACING_POW2: [1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,32768,65536,131072,262144,524288,1048576,2097152,4194304,8388608],
+      };
+
+      // [Ghidra: Terrain_generateTerrain, this pass] Generates the PROCEDURAL BASE
+      // heightmap (before any .sco paint-layer delta is applied): world-size jitter,
+      // per-vertex Perlin-driven noise field, then a border ridge-raising pass, then a
+      // valley-ring carving pass, then a final "shift so the grid minimum sits at 0" pass.
+      // seedA is rngSeedSourceA (see Terrain_Build's Ghidra comment: A seeds this function
+      // + generateLayers; B reseeds before generateRiver, which isn't called from here).
+      // gridW/gridH are gridWidthMinusOne/gridHeightMinusOne (grid is (gridW+1)x(gridH+1)
+      // vertices); cellSize is the terrain's per-cell world size.
+      // NOT INCLUDED: generateRiver/smoothHeight/computeVertexLayerIntensities/
+      // selectFaceOrientation/selectFaceLayers/roughenRockVertices/generateFlora - these run
+      // after this function in Terrain_Build's confirmed call order but are separate,
+      // not-yet-ported functions (see the file-level comment block above and the STUBs
+      // below).
+      function generateTerrainHeightmap(gridW, gridH, cellSize, hillHeight, vegetation) {
+        // CORRECTED this pass: does NOT call setSeed() itself anymore. [Ghidra, fresh
+        // disassembly: Terrain_Build] g_terrainRngState is seeded ONCE with seed0, and
+        // Terrain_generateLayers (aPaintLayerSlots[0] coinflip + 2-3 more draws) runs BEFORE
+        // Terrain_generateTerrain in that SAME unbroken stream - this function's own first
+        // draws are really the engine's 3rd/4th (or 4th/5th) draws, not the 1st/2nd. Calling
+        // setSeed() here reset the stream and desynced everything from that point on (a
+        // multiplicative LCG desynced by even one draw is fully decorrelated, not "slightly
+        // shifted"). The caller (generateTerrain()) now does the seeding + generateLayers'
+        // draws immediately before calling this function.
+        hillHeight = (hillHeight === undefined) ? 30 : hillHeight; // terrain code's Hill Height field (0-127); default only used if no terrain code loaded
+
+        const w = gridW + 1, h = gridH + 1;
+        const terrainWorldSizeX = w * cellSize; // matches Terrain_Build's confirmed gridDim*cellSize relationship
+        const terrainWorldSizeY = h * cellSize;
+
+        // LITERAL re-port from Terrain_generateTerrain's raw decompile (0x00508170, re-fetched
+        // and re-verified this pass - a previous port here had drifted from the real draw
+        // sequence and loop structure; this replaces it). draw1 feeds a LOCAL value used only
+        // by the later ring-count log() call; draw2 feeds flNoiseFrequencyScale, consumed by
+        // the heightFactor pass below - these are DIFFERENT values, not one reused as both.
+        const draw1 = lcgNext();
+        const draw2 = lcgNext();
+        const ringCountBaseSize = (terrainWorldSizeY + terrainWorldSizeX) * 0.5 * (((draw1 >>> 16 & 0x7fff) % 15817) / 15817.0 * 0.5 + 1.0);
+        const noiseFrequencyScale = (terrainWorldSizeY + terrainWorldSizeX) * 0.2 * (((draw2 >>> 16 & 0x7fff) % 15817) / 15817.0 * 0.5 + 1.0);
+        const noiseOffX = rand01() * TERRAIN_CONST.NOISE_OFFSET_AMPLITUDE;
+        const noiseOffY = rand01() * TERRAIN_CONST.NOISE_OFFSET_AMPLITUDE;
+        const noiseOffZ = rand01() * TERRAIN_CONST.NOISE_OFFSET_AMPLITUDE;
+
+        const heights = new Float32Array(w * h);
+        const heightFactor = new Float32Array(w * h);
+        const idx = (col, row) => row * w + col;
+
+        // Pass 1 (CONFIRMED this pass, previously missing entirely): per-vertex heightFactor,
+        // a single-octave Perlin field over the WHOLE grid (not just the border), computed
+        // while height is still 0 everywhere (Terrain_InitVertex runs before this). Consumed
+        // by valley carving below - previously hardcoded to a constant 1.0 there, which
+        // over-carved every valley to maximum depth everywhere instead of the real spatially-
+        // varying [0.1, 1.0] factor.
+        for (let row = 0; row < h; row++) {
+          for (let col = 0; col < w; col++) {
+            const i = idx(col, row);
+            const n = rglPerlinOctave(noiseFrequencyScale, 0.6, 1, 0, col * cellSize + noiseOffX, row * cellSize + noiseOffY, noiseOffZ);
+            let f = (n[0] + n[1] + n[2]) * (hillHeight / 100.0) * 9.0;
+            f = Math.max(0.0, Math.min(1.0, f));
+            heightFactor[i] = (Math.cos(f * Math.PI) + 1.0) * 0.45 + 0.1;
+          }
+        }
+
+        // Pass 2 (CORRECTED this pass, second correction pass - fresh disassembly, not just
+        // decompile paraphrase): border ridge-raising, 2 orientations x 13 bands. THREE
+        // previously-wrong details, all now fixed:
+        // (a) the RNG draw for ridge amplitude is made ONCE, before the whole 2x13 loop, and
+        //     REUSED unchanged for all 26 iterations - an earlier port redrew it every band.
+        // (b) the per-band angle is `(1.0 - band/13) * 3.2` (decreasing, range 3.2->~0.25),
+        //     not `(band/13) * PI` (increasing) - opposite direction and different max.
+        // (c) NEW this pass, settled via a manual stack-offset trace of the raw disassembly
+        //     around the rglPerlinOctave call (not decompiler variable naming, which is
+        //     ambiguous here): the floor-candidate formula reads Perlin output COMPONENT
+        //     INDEX 2 (Z), doubled - `outNoise[2]*2.0 + 0.4` - not component [0]. AND the two
+        //     orientations had row/col swapped: orientation 0 raises a LEFT-edge band
+        //     (col=band) and a RIGHT-edge band (col=gridW-band), each swept across the FULL
+        //     ROW range (bound=gridH); orientation 1 raises a TOP-edge band (row=band) and a
+        //     BOTTOM-edge band (row=gridH-band), each swept across the FULL COLUMN range
+        //     (bound=gridW) - an earlier port had orientation 0 varying row-by-band instead
+        //     of col-by-band.
+        {
+          const uVar6 = lcgNext() >>> 16;
+          const ampFactor = ((uVar6 & 0x7fff) % 15817) / 15817.0 * 3.0 + 7.0;
+          for (let orientation = 0; orientation < 2; orientation++) {
+            const bandRadius = orientation === 0 ? gridH : gridW; // sweep bound: gridH for L/R edges (row sweep), gridW for T/B edges (col sweep)
+            for (let band = 0; band < 13; band++) {
+              const angle = (1.0 - band * 0.07692308) * 3.2;
+              const fVar1 = Math.sin(angle) * ampFactor;
+              for (let sweep = 0; sweep <= bandRadius; sweep++) {
+                let r1, c1, r2, c2;
+                if (orientation === 0) { c1 = band; r1 = sweep; c2 = gridW - band; r2 = sweep; }       // left/right edge bands
+                else { r1 = band; c1 = sweep; r2 = gridH - band; c2 = sweep; }                          // top/bottom edge bands
+                if (r1 >= 0 && r1 <= gridH && c1 >= 0 && c1 <= gridW) {
+                  const i1 = idx(c1, r1);
+                  const n = rglPerlinOctave(40.0, 0.6, 4, 0, c1 * cellSize + noiseOffX, r1 * cellSize + noiseOffY, heights[i1] + noiseOffZ);
+                  const cand = (n[2] + n[2] + 0.4) * fVar1;
+                  if (heights[i1] < cand) heights[i1] = cand;
+                }
+                if (r2 >= 0 && r2 <= gridH && c2 >= 0 && c2 <= gridW) {
+                  const i2 = idx(c2, r2);
+                  const n = rglPerlinOctave(40.0, 0.6, 4, 0, c2 * cellSize + noiseOffX, r2 * cellSize + noiseOffY, heights[i2] + noiseOffZ);
+                  const cand = (n[2] + n[2] + 0.4) * fVar1;
+                  if (heights[i2] < cand) heights[i2] = cand;
+                }
+              }
+            }
+          }
+        }
+
+        // Valley-ring carving pass (Terrain_ApplyValley call loop). [Ghidra: fresh disassembly
+        // of Terrain_generateTerrain @0x00508170, ~0x005086c2-0x005087ea this pass - REPLACES
+        // a previous, wrong port that used terrainWorldSizeX/RING_RADIUS_DIVISOR/natural-log
+        // and a 5-entry powers-of-4 spacing table. Confirmed exact:
+        //   vegetation = clamp((terrainTypeFlags>>14) & 127, 0, 99)   // the terrain code's own
+        //     Vegetation field, already parsed as currentTerrainCode.vegetation
+        //   bandRadius = max(2.0, ringCountBaseSize / (pow((100-vegetation)*0.045, 2) * 4.0))
+        //   ringCount  = round(log(bandRadius) * 1.442695)   // = round(log2(bandRadius))
+        // then for ring=0..ringCount inclusive: radiusScale=ringCountBaseSize/spacing[ring]
+        // (spacing[ring]=2^ring, VALLEY_RING_SPACING_POW2 above), densityScale=1.0 except on
+        // the LAST ring where it's (bandRadius-spacing[ringCount])/spacing[ringCount].
+        const vegClamped = Math.max(0, Math.min(99, vegetation));
+        const ringDivisor = Math.pow((100 - vegClamped) * 0.045, 2) * 4.0;
+        const bandRadius = Math.max(2.0, ringCountBaseSize / ringDivisor);
+        const ringCount = Math.round(Math.log(bandRadius) * 1.4426950408889634);
+        let strengthWeight = 1.0;
+        for (let ring = 0; ring <= ringCount; ring++) {
+          const spacing = TERRAIN_CONST.VALLEY_RING_SPACING_POW2[Math.min(ring, TERRAIN_CONST.VALLEY_RING_SPACING_POW2.length - 1)];
+          const lastRingSpacing = TERRAIN_CONST.VALLEY_RING_SPACING_POW2[Math.min(ringCount, TERRAIN_CONST.VALLEY_RING_SPACING_POW2.length - 1)];
+          const densityScale = ring === ringCount ? (bandRadius - lastRingSpacing) / lastRingSpacing : 1.0;
+          applyValleyRing(heights, heightFactor, w, h, cellSize, terrainWorldSizeX, terrainWorldSizeY,
+                           ringCountBaseSize / spacing, densityScale, strengthWeight, hillHeight);
+          strengthWeight -= TERRAIN_CONST.VALLEY_STEP;
+        }
+
+        // Final "shift so grid minimum = 0" pass.
+        let minH = Infinity;
+        for (let i = 0; i < heights.length; i++) if (heights[i] < minH) minH = heights[i];
+        for (let i = 0; i < heights.length; i++) heights[i] -= minH;
+
+        return { width: w, height: h, heights };
+      }
+
+      // [Ghidra: Terrain_ApplyValley @ 0x00507430, this session] BYTE-EXACT port,
+      // reconstructed by manually tracing the x87 disassembly (Ghidra's decompiler drops
+      // several float args passed on the FPU stack) and reading every literal constant
+      // via read_bytes. See the Ghidra comment on this address for the full derivation.
+      //   densityWeight = rand01()*0.2 + 0.4
+      //   areaFactor    = (worldSizeX*densityScale*worldSizeY) / (0.25*radiusScale^2)
+      //   valleyCount   = round(round(areaFactor) * densityWeight * 30.0)
+      // then per valley: radius = radiusScale*(Bell4Sum()*0.5+0.05);
+      //   posY = (worldSizeY+2*radiusScale)*rand01() - radiusScale
+      //   posX = (worldSizeX+2*radiusScale)*rand01() - radiusScale
+      //   strength = radius*strengthWeight*(rand01()*0.1 + 0.2)
+      // Draw order matters (global RNG state): densityWeight draw, then per-valley:
+      // Bell4Sum (4 draws), posY draw, posX draw, strength draw - exactly this sequence.
+      function applyValleyRing(heights, heightFactor, w, h, cellSize, worldSizeX, worldSizeY, radiusScale, densityScale, strengthWeight, hillHeight) {
+        const densityWeight = rand01() * 0.2 + 0.4;
+        const areaFactor = (worldSizeX * densityScale * worldSizeY) / (0.25 * radiusScale * radiusScale);
+        const valleyCount = Math.round(Math.round(areaFactor) * densityWeight * 30.0);
+        const boundsMargin = radiusScale * 2;
+        for (let v = 0; v < valleyCount; v++) {
+          const radius = radiusScale * (randomBell4Sum() * 0.5 + 0.05);
+          const posY = (worldSizeY + boundsMargin) * rand01() - radiusScale;
+          const posX = (worldSizeX + boundsMargin) * rand01() - radiusScale;
+          const strength = radius * strengthWeight * (rand01() * 0.1 + 0.2);
+          carveValleyAt(heights, heightFactor, w, h, cellSize, posX, posY, radius, strength, hillHeight);
+        }
+      }
+
+      // [Ghidra: Terrain_CarveValleyAt @ 0x00504150, this session] BYTE-EXACT port.
+      // See the Ghidra comment on this address for the manual disasm trace that resolved
+      // CRT_cos's argument (a decompiler limitation, not a genuinely ambiguous term).
+      //   delta = (cos((dist/radius)*PI) + 1.0) * 0.5 * strength * heightFactor * (hillHeight*0.01)
+      // heightFactor is the REAL per-vertex field (see generateTerrainHeightmap's Pass 1,
+      // this pass) - CORRECTED from a previous version of this function that hardcoded it to
+      // a constant 1.0 (wrongly assuming it was never modified before this point; it's
+      // actually a full per-vertex Perlin field in range [0.1, 1.0] computed earlier in the
+      // same Terrain_generateTerrain call, before border ridges even run).
+      function carveValleyAt(heights, heightFactor, w, h, cellSize, cx, cy, radius, strength, hillHeight) {
+        const minCol = Math.max(0, Math.ceil((cx - radius) / cellSize));
+        const maxCol = Math.min(w - 1, Math.floor((cx + radius) / cellSize));
+        const minRow = Math.max(0, Math.ceil((cy - radius) / cellSize));
+        const maxRow = Math.min(h - 1, Math.floor((cy + radius) / cellSize));
+        const hillFactor = hillHeight * 0.01;
+        for (let row = minRow; row <= maxRow; row++) {
+          for (let col = minCol; col <= maxCol; col++) {
+            const dx = col * cellSize - cx, dy = row * cellSize - cy;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist / radius < 1.0) {
+              const i = row * w + col;
+              const delta = (Math.cos((dist / radius) * Math.PI) + 1.0) * 0.5 * strength * heightFactor[i] * hillFactor;
+              heights[i] += delta;
+            }
+          }
+        }
+      }
+
+      // [Ghidra: Terrain_smoothHeight @ 0x005004a0, fresh disassembly this pass - every
+      // constant independently read from its exact memory address, not decompiler-paraphrased]
+      // EXACT single-pass (not iterated) 3x3-neighbor-average height smoothing: up to 8
+      // neighbors, boundary-clamped (an out-of-grid neighbor is simply not counted, not
+      // wrapped/edge-clamped), blended toward the vertex's own height by a clamped, randomly-
+      // jittered factor. Confirmed constants: clamp bounds -10.0 (@0x00810210) / 2.0
+      // (@0x007c28e8); jitter scale = rand01()*0.4+0.2 (@0x007c1608/@0x007c1a98). Consumes
+      // exactly one LCG draw per vertex, in row-outer/col-inner order (matches the engine's
+      // own row/col stride convention). Writes both z and heightBackup together - modeled
+      // here as simply returning the new height array, since this project's `heights` array
+      // already serves as both (see generateTerrain()'s own heightBackup-tracking comment).
+      function smoothHeightPass(heights, width, height) {
+        const out = new Float32Array(heights);
+        for (let row = 0; row < height; row++) {
+          for (let col = 0; col < width; col++) {
+            let sum = 0, count = 0;
+            for (let dr = -1; dr <= 1; dr++) {
+              for (let dc = -1; dc <= 1; dc++) {
+                if (dr === 0 && dc === 0) continue;
+                const r = row + dr, c = col + dc;
+                if (r < 0 || r >= height || c < 0 || c >= width) continue;
+                sum += heights[r * width + c];
+                count++;
+              }
+            }
+            const i = row * width + col;
+            const avg = count > 0 ? sum / count : heights[i];
+            let delta = avg - heights[i];
+            delta = Math.max(-10.0, Math.min(2.0, delta));
+            const jitterScale = rand01() * 0.4 + 0.2; // one LCG draw per vertex, unconditional
+            out[i] = heights[i] + delta * jitterScale;
+          }
+        }
+        return out;
+      }
+
+      // [Ghidra: Terrain_roughenRockVertices @ 0x00501020, fresh disassembly this pass]
+      // EXACT. Confirmed struct offsets (z=+0x08, heightBackup=+0x84, layer0Weight=+0x4c,
+      // layer1Weight=+0x50, independently cross-checked against get_struct_layout) and
+      // constants (threshold 0.5 @0x007c09b8 - reused for both the gate and the jitter
+      // formula's "-0.5"; scale 0.7 @0x007c1aa0, actually float(0.7) promoted to double,
+      // ~0.699999988). Runs AFTER Terrain_computeVertexLayerIntensities (needs its
+      // layer0Weight/layer1Weight output) - a genuine ordering dependency confirmed via
+      // struct-offset trace of computeVertexLayerIntensities itself, not reorderable.
+      // Consumes one LCG draw per QUALIFYING vertex only (not every vertex).
+      function roughenRockVerticesPass(heights, layer0Weight, layer1Weight, width, height, cellSize) {
+        const out = new Float32Array(heights);
+        for (let row = 0; row < height; row++) {
+          for (let col = 0; col < width; col++) {
+            const i = row * width + col;
+            if (layer0Weight[i] + layer1Weight[i] < 0.5) {
+              const jitter = (rand01() - 0.5) * (1.0 - layer0Weight[i]) * cellSize * 0.7;
+              out[i] = heights[i] + jitter;
+            }
+          }
+        }
+        return out;
+      }
+
+      // --- STUBS: not implemented this pass (out of scope for the current terrain-HEIGHT fix -
+      // these affect face/flora selection and outer-border decoration, not vertex height) ---
+      function Terrain_selectFaceLayers_STUB(/* this */) { /* Ghidra @ 0x00500cd0 - confirmed flora-placement-only, see plan/OPEN_QUESTIONS.md */ }
+      function Terrain_generateOuterTerrain_STUB(/* this */) { /* Ghidra @ 0x0056b6b0 - not decompiled this pass */ }
+      function Terrain_generateFlora_STUB(/* this */) { /* Ghidra @ 0x004ffe60 - not decompiled this pass */ }
+
+      // [Ghidra this pass, ground truth for the ground-paint layer index->texture mapping:
+      // Data/ground_specs.txt (11 lines, indices 0-10, in file order - matches
+      // Terrain_LoadGroundPaintData's confirmed clamp of numLayers to 13 = 11 generic +
+      // elevation + leveling) each line is `name numUV texture tiling bumpTextureOrNone
+      // tintR tintG tintB`. tint is a MULTIPLICATIVE light color the engine applies over
+      // the named ground texture (values >1.0 are valid - a brightening tint, e.g. snow's
+      // 1.4/1.4/1.4). Only 4 of the 11 referenced textures (snow, ground_earth,
+      // ground_village, ground_path) are shipped inside the Napoleonic Wars module itself
+      // (checked via Glob against its Textures/ folder) - the rest live in the base
+      // Native module, outside this project's permitted filesystem scope, so were not
+      // read/embedded. For those 7, `tint` is used directly as a flat fallback color
+      // (normalized so any component >1.0 doesn't clip) rather than fabricating a texture.
+      // -------------------- Ground textures --------------------
+      // Fetched LIVE from texture_server.py (shipped alongside this HTML) rather than
+      // embedded - per explicit user request to pull real assets straight from the
+      // Warband install (Napoleonic Wars' loose Textures/ folder) instead of a fixed
+      // baked-in subset. `texName` is the exact filename (no extension) the server
+      // should look up; several are ground_specs.txt's own referenced texture name
+      // (e.g. "ground_earth", "snow") which happen to exist as loose .dds files -
+      // others (stone_a, patch_rock, ground_steppe, ground_desert, ground_forest,
+      // pebbles) do NOT exist as loose files (they live inside Native's compiled .brf
+      // archives, out of this project's reach without a full BRF parser) and will 404
+      // from the server, falling back to the flat tint color below - documented
+      // limitation, not silently faked. `turf` uses ground_specs.txt's own literal name
+      // "grassy_ground" - not a loose .dds file itself, but texture_server.py resolves it
+      // as a MATERIAL name via a byte-level parse of CommonRes/materials.brf, which binds
+      // it to the real diffuse texture "ground1.dds" (verified on disk, cross-checked
+      // against two separate materials.brf entries for this name). Note "mmgrass" is a
+      // tempting-looking name but is actually a grass-TUFT billboard sprite (alpha-cutout,
+      // mostly-transparent background), not a tileable ground diffuse - confirmed by
+      // inspecting its decoded pixels (mostly near-black/RGB(0,0,0), consistent with an
+      // alpha-discarded transparent background) after it produced a much-too-dark terrain.
+      const GROUND_LAYERS = [
+        { name: 'gray_stone',  tint: [0.70, 0.70, 0.70], texName: 'stone_a' },
+        { name: 'brown_stone', tint: [0.70, 0.70, 0.70], texName: 'patch_rock' },
+        { name: 'turf',        tint: [0.42, 0.59, 0.17], texName: 'grassy_ground' },
+        { name: 'steppe',      tint: [0.85, 0.73, 0.36], texName: 'ground_steppe' },
+        { name: 'snow',        tint: [1.40, 1.40, 1.40], texName: 'snow' },
+        { name: 'earth',       tint: [0.70, 0.50, 0.23], texName: 'ground_earth' },
+        { name: 'desert',      tint: [1.40, 1.20, 0.40], texName: 'ground_desert' },
+        { name: 'forest',      tint: [0.60, 0.42, 0.28], texName: 'ground_forest' },
+        { name: 'pebbles',     tint: [0.70, 0.70, 0.70], texName: 'pebbles' },
+        { name: 'village',     tint: [1.00, 0.90, 0.59], texName: 'ground_village' },
+        { name: 'path',        tint: [0.93, 0.68, 0.34], texName: 'ground_path' },
+      ];
+      function fallbackFlatColor(tint) {
+        const m = Math.max(1.0, tint[0], tint[1], tint[2]);
+        return [tint[0] / m, tint[1] / m, tint[2] / m];
+      }
+
+      // -------------------- WebGL texture creation --------------------
+      function make1x1Texture(rgb) {
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        const bytes = new Uint8Array([
+          Math.round(rgb[0] * 255), Math.round(rgb[1] * 255), Math.round(rgb[2] * 255), 255
+        ]);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, bytes);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        return tex;
+      }
+      // Resolves texName straight from the real Warband install's .dds files via
+      // WarbandAssets (client-side: search-dir priority + materials.brf fallback +
+      // DDS/S3TC decode - see warband_assets.js; texture_server.py itself no longer
+      // interprets any game data, just serves raw bytes). Starts as a flat
+      // fallback-color 1x1 texture, upgraded in place on successful async
+      // resolve+decode; silently keeps the fallback forever if not found or S3TC
+      // is unavailable (both normal/expected, not bugs).
+      // `tile`=true (ground textures): REPEAT wrap + mipmaps. `tile`=false (billboard
+      // sprites): CLAMP wrap, no mipmaps (avoids the classic alpha-cutout mipmap-halo
+      // artifact around foliage edges).
+      function loadServerTexture(texName, fallbackTint, tile) {
+        if (tile === undefined) tile = true;
+        const tex = make1x1Texture(fallbackFlatColor(fallbackTint));
+        WarbandAssets.loadTextureOnto(gl, tex, texName, tile).catch(() => {});
+        return tex;
+      }
+      const groundTextures = GROUND_LAYERS.map(layer => loadServerTexture(layer.texName, layer.tint, true));
+      const FLAT_FALLBACK_TEX = make1x1Texture([0.4, 0.55, 0.3]); // used when a vertex has zero paint-layer weight anywhere
+
+      // -------------------- Flora/prop REAL 3D meshes --------------------
+      // Entity records (e.g. "spr_mm_tree_vegetation1", "spr_flora_bush_green_newa") are
+      // resolved to their real compiled mesh geometry entirely client-side via
+      // WarbandAssets.getMeshData(): parses scene_props.txt (entity name -> real mesh base
+      // name, e.g. mm_vegetation_tree1, and the sokf_invisible check), then extracts that
+      // mesh's actual vertex/normal/uv/face data straight from the game's own .brf resource
+      // files (see warband_assets.js / brf_parser.py - format reverse-engineered against
+      // OpenBRF's own published C++ source, not guessed). Real 3D geometry, not a billboard
+      // approximation. texture_server.py itself no longer resolves any of this - it just
+      // serves the raw .brf/.txt bytes WarbandAssets asks for.
+      const meshGeometryCache = new Map(); // entityName -> Promise<{pieces:[...]}>
+      function fetchMeshGeometry(entityName) {
+        if (!meshGeometryCache.has(entityName)) {
+          meshGeometryCache.set(entityName, WarbandAssets.getMeshData(entityName).catch(() => ({ pieces: [] })));
+        }
+        return meshGeometryCache.get(entityName);
+      }
+      const entityTextureCache = new Map(); // textureName -> WebGLTexture
+      // REPEAT wrap + mipmaps, NOT clamp: real mesh diffuse textures tile (confirmed - the
+      // tree trunk mesh's own UVs range up to ~6.19, not clamped to [0,1], a classic
+      // wrapped-bark-around-a-cylinder technique). CLAMP_TO_EDGE (this function's original,
+      // billboard-sprite-era setting) stretches/smears the texture's edge pixels across
+      // that whole >1 UV range instead of repeating it - looked stretched/"plastic".
+      function getEntityTexture(textureName) {
+        if (!entityTextureCache.has(textureName)) {
+          const tex = make1x1Texture([0.5, 0.5, 0.5]);
+          WarbandAssets.loadTextureOnto(gl, tex, textureName, true).catch(() => {});
+          entityTextureCache.set(textureName, tex);
+        }
+        return entityTextureCache.get(textureName);
+      }
+
+      // -------------------- Shaders --------------------
+      // Terrain: up to 8 ground-layer textures blended per-vertex by real paint-layer
+      // weights read from the .sco (see parseSCO below) - always samples all 8 units and
+      // lets zero weight contribute nothing, so no dynamic branching is needed (WebGL1/
+      // GLSL ES 1.00 safe). Lighting is a simple ambient+diffuse term; the engine's own
+      // lightmap-bake/sun-visibility pass (Terrain_RefreshLightingRiverAndFlora et al.)
+      // was not ported this session, so this is a documented simplification, same spirit
+      // as the original three.js MeshStandardMaterial + DirectionalLight it replaces.
+      const terrainVS = `
+        attribute vec3 aPosition;
+        attribute vec3 aNormal;
+        attribute float aShadow;
+        attribute vec4 aWeights0;
+        attribute vec4 aWeights1;
+        uniform mat4 uViewProj;
+        varying vec3 vNormal;
+        varying vec3 vWorldPos;
+        varying float vShadow;
+        varying vec4 vWeights0;
+        varying vec4 vWeights1;
+        void main() {
+          vWorldPos = aPosition;
+          vNormal = aNormal;
+          vShadow = aShadow;
+          vWeights0 = aWeights0;
+          vWeights1 = aWeights1;
+          gl_Position = uViewProj * vec4(aPosition, 1.0);
+        }
+      `;
+      // Ground-layer weights (vWeights0/1) are now the EXACT Terrain_computeFaceLayerIntensities
+      // "over" composite (see compositeFaceChannels() in JS above), not a normalize-by-total-weight
+      // blend - and since that composite's fallback channel (always-1.0, lowest priority) guarantees
+      // full coverage, the 8 unit weights always sum to ~1.0 already; no renormalization or
+      // slope-based rock-blend hack is needed or applied (the old uTexRock/rockWeight approximation
+      // is removed - the region-base material's own slope-fade term, baked into vWeights0.x by
+      // computeVertexLayerWeights(), is what the real engine uses for that visual effect).
+      const terrainFS = `
+        precision mediump float;
+        varying vec3 vNormal;
+        varying vec3 vWorldPos;
+        varying float vShadow;
+        varying vec4 vWeights0;
+        varying vec4 vWeights1;
+        uniform sampler2D uTex0;
+        uniform sampler2D uTex1;
+        uniform sampler2D uTex2;
+        uniform sampler2D uTex3;
+        uniform sampler2D uTex4;
+        uniform sampler2D uTex5;
+        uniform sampler2D uTex6;
+        uniform sampler2D uTex7;
+        uniform float uUseTextures;
+        uniform float uTexScale;
+        uniform vec3 uLightDir;
+        uniform vec3 uLightColor;
+        uniform vec3 uAmbientColor;
+        void main() {
+          vec2 uv = vWorldPos.xz / uTexScale;
+          vec3 base;
+          vec3 n = normalize(vNormal);
+          if (uUseTextures > 0.5) {
+            base  = texture2D(uTex0, uv).rgb * vWeights0.x;
+            base += texture2D(uTex1, uv).rgb * vWeights0.y;
+            base += texture2D(uTex2, uv).rgb * vWeights0.z;
+            base += texture2D(uTex3, uv).rgb * vWeights0.w;
+            base += texture2D(uTex4, uv).rgb * vWeights1.x;
+            base += texture2D(uTex5, uv).rgb * vWeights1.y;
+            base += texture2D(uTex6, uv).rgb * vWeights1.z;
+            base += texture2D(uTex7, uv).rgb * vWeights1.w;
+          } else {
+            base = vec3(0.4, 0.55, 0.3);
+          }
+          // [Ghidra: Terrain_ComputeVertexSunVisibility_LightmapTexelBake, this session]
+          // EXACT confirmed lighting formula: (ambient*1.5 + diff*shadow*direct) * albedo.
+          float diff = max(dot(n, -uLightDir), 0.0);
+          vec3 lit = (uAmbientColor * 1.5 + uLightColor * diff * vShadow) * base;
+          gl_FragColor = vec4(lit, 1.0);
+        }
+      `;
+
+      // Water: NOT a byte-exact port of the real river/water mesh (Terrain_generateRiver /
+      // Terrain_BuildRiverRenderMesh @0x0056ba20 / Terrain_BuildRiverChunkSubMesh - traced
+      // this session, see OPEN_QUESTIONS.md/COMPLETED_WORK.md - that requires walking
+      // River_WalkPath's carved channel, out of scope). This IS informed by what those
+      // functions confirmed about how the engine treats water:
+      //  - rglMesh_BlendVerticesTowardWaterLevel (0x0056c270) blends shoreline vertices
+      //    toward the water surface based on a depth-derived factor - reproduced here as a
+      //    per-vertex depth-based color/alpha ramp (uses the REAL loaded heightmap, not a
+      //    guess: depth = waterLevel - actualTerrainHeightAtThatXZ).
+      //  - Terrain_BuildRiverRenderMesh treats aVertexGrid[].z <= -0.3 as "underwater".
+      //  - A believable fresnel term + gentle animated ripple are added on top as a
+      //    genuine rendering improvement over the prior flat semi-transparent plane -
+      //    procedural, not sampled from any traced engine shader (the D3D fixed-function/
+      //    shader-constant water appearance itself was not decompiled this session).
+      const waterVS = `
+        attribute vec3 aPosition;
+        attribute float aDepth;
+        uniform mat4 uViewProj;
+        uniform highp float uTime; // explicit to match the fragment shader's explicit highp declaration
+        varying vec3 vWorldPos;
+        varying float vDepth;
+        void main() {
+          vec3 pos = aPosition;
+          pos.y += sin(pos.x * 0.15 + uTime * 1.3) * 0.05 + cos(pos.z * 0.13 + uTime * 1.7) * 0.05;
+          vWorldPos = pos;
+          vDepth = aDepth;
+          gl_Position = uViewProj * vec4(pos, 1.0);
+        }
+      `;
+      const waterFS = `
+        precision mediump float;
+        varying vec3 vWorldPos;
+        varying float vDepth;
+        uniform vec3 uCameraPos;
+        uniform highp float uTime; // must match the vertex shader's default (highp) precision for this uniform - WebGL1 link error otherwise
+        uniform vec3 uShallowColor;
+        uniform vec3 uDeepColor;
+        uniform vec3 uSkyColor;
+        void main() {
+          vec3 viewDir = normalize(uCameraPos - vWorldPos);
+          float nx = sin(vWorldPos.x * 0.4 + uTime * 1.1) * 0.15 + sin(vWorldPos.z * 0.7 - uTime * 0.6) * 0.10;
+          float nz = cos(vWorldPos.z * 0.4 - uTime * 1.3) * 0.15 + cos(vWorldPos.x * 0.6 + uTime * 0.5) * 0.10;
+          vec3 n = normalize(vec3(nx, 1.0, nz));
+          float fresnel = pow(1.0 - max(dot(viewDir, n), 0.0), 4.0);
+          float depthFactor = clamp(vDepth / 6.0, 0.0, 1.0);
+          vec3 waterColor = mix(uShallowColor, uDeepColor, depthFactor);
+          vec3 color = mix(waterColor, uSkyColor, fresnel * 0.6);
+          float alpha = mix(0.55, 0.92, depthFactor * 0.6 + fresnel * 0.4);
+          gl_FragColor = vec4(color, alpha);
+        }
+      `;
+
+      const terrainProgram = linkProgram(terrainVS, terrainFS);
+      const terrainLoc = {
+        aPosition: gl.getAttribLocation(terrainProgram, 'aPosition'),
+        aNormal: gl.getAttribLocation(terrainProgram, 'aNormal'),
+        aShadow: gl.getAttribLocation(terrainProgram, 'aShadow'),
+        aWeights0: gl.getAttribLocation(terrainProgram, 'aWeights0'),
+        aWeights1: gl.getAttribLocation(terrainProgram, 'aWeights1'),
+        uViewProj: gl.getUniformLocation(terrainProgram, 'uViewProj'),
+        uUseTextures: gl.getUniformLocation(terrainProgram, 'uUseTextures'),
+        uTexScale: gl.getUniformLocation(terrainProgram, 'uTexScale'),
+        uLightDir: gl.getUniformLocation(terrainProgram, 'uLightDir'),
+        uLightColor: gl.getUniformLocation(terrainProgram, 'uLightColor'),
+        uAmbientColor: gl.getUniformLocation(terrainProgram, 'uAmbientColor'),
+        uTex: [0,1,2,3,4,5,6,7].map(i => gl.getUniformLocation(terrainProgram, 'uTex' + i)),
+      };
+      const waterProgram = linkProgram(waterVS, waterFS);
+      const waterLoc = {
+        aPosition: gl.getAttribLocation(waterProgram, 'aPosition'),
+        aDepth: gl.getAttribLocation(waterProgram, 'aDepth'),
+        uViewProj: gl.getUniformLocation(waterProgram, 'uViewProj'),
+        uTime: gl.getUniformLocation(waterProgram, 'uTime'),
+        uCameraPos: gl.getUniformLocation(waterProgram, 'uCameraPos'),
+        uShallowColor: gl.getUniformLocation(waterProgram, 'uShallowColor'),
+        uDeepColor: gl.getUniformLocation(waterProgram, 'uDeepColor'),
+        uSkyColor: gl.getUniformLocation(waterProgram, 'uSkyColor'),
+      };
+
+      // Entity meshes (trees/bushes/props) - real 3D geometry resolved client-side via
+      // WarbandAssets.getMeshData() (see fetchMeshGeometry above), pre-transformed
+      // to world space CPU-side per instance (position/normal baked in at buffer-build
+      // time in buildEntityMeshes - no per-draw model matrix needed, same approach the
+      // terrain mesh already uses). Alpha-tested (leaf/foliage textures are cutout), lit
+      // with the same confirmed (ambient*1.5 + diff*direct)*albedo formula as terrain.
+      const meshVS = `
+        attribute vec3 aPosition;
+        attribute vec3 aNormal;
+        attribute vec2 aUV;
+        uniform mat4 uViewProj;
+        varying vec3 vNormal;
+        varying vec2 vUV;
+        void main() {
+          vNormal = aNormal;
+          vUV = aUV;
+          gl_Position = uViewProj * vec4(aPosition, 1.0);
+        }
+      `;
+      const meshFS = `
+        precision mediump float;
+        varying vec3 vNormal;
+        varying vec2 vUV;
+        uniform sampler2D uTex;
+        uniform vec3 uLightDir;
+        uniform vec3 uLightColor;
+        uniform vec3 uAmbientColor;
+        void main() {
+          vec4 c = texture2D(uTex, vUV);
+          if (c.a < 0.5) discard;
+          vec3 n = normalize(vNormal);
+          float diff = max(dot(n, -uLightDir), 0.0);
+          vec3 lit = (uAmbientColor * 1.5 + uLightColor * diff) * c.rgb;
+          gl_FragColor = vec4(lit, 1.0);
+        }
+      `;
+      const entityProgram = linkProgram(meshVS, meshFS);
+      const entityLoc = {
+        aPosition: gl.getAttribLocation(entityProgram, 'aPosition'),
+        aNormal: gl.getAttribLocation(entityProgram, 'aNormal'),
+        aUV: gl.getAttribLocation(entityProgram, 'aUV'),
+        uViewProj: gl.getUniformLocation(entityProgram, 'uViewProj'),
+        uTex: gl.getUniformLocation(entityProgram, 'uTex'),
+        uLightDir: gl.getUniformLocation(entityProgram, 'uLightDir'),
+        uLightColor: gl.getUniformLocation(entityProgram, 'uLightColor'),
+        uAmbientColor: gl.getUniformLocation(entityProgram, 'uAmbientColor'),
+      };
+
+      // One GL mesh (posBuf/normBuf/uvBuf/idxBuf) per distinct (entityName, piece,
+      // texture) combo, built once per .sco load - see buildEntityMeshes() below.
+      let entityMeshGroups = []; // [{ tex, posBuf, normBuf, uvBuf, idxBuf, idxCount, idxType }]
+      function disposeEntityMeshes() {
+        for (const g of entityMeshGroups) {
+          gl.deleteBuffer(g.posBuf); gl.deleteBuffer(g.normBuf);
+          gl.deleteBuffer(g.uvBuf); gl.deleteBuffer(g.idxBuf);
+        }
+        entityMeshGroups = [];
+      }
+      let entityBuildToken = 0; // invalidates an in-flight async build superseded by a newer .sco load
+      // REMOVED this pass: an X-mirror previously applied to entity positions here (to match
+      // a mirror also previously applied to the terrain heightmap in parseSCO - see that
+      // function's own comment for the fresh, comprehensive Ghidra re-trace that found no
+      // mirroring anywhere in the real load->build chain). Entity positions now compose
+      // directly in native engine space with no reversal, consistent with the terrain
+      // heightmap no longer being mirrored either.
+      //
+      // Real mesh geometry (from brf_parser.py, see fetchMeshGeometry above) is returned
+      // in NATIVE ENGINE space (no axis remap at all - see brf_parser.py's _point3 note),
+      // specifically so it composes directly with the entity's own engine-space transform
+      // (mtx 3x3 rotation, row-major - main2.html's own parseSCO comment; pos; scale)
+      // before a SINGLE engine-to-render remap is applied to the fully-composed world
+      // point, matching how every other coordinate in this file is remapped exactly once.
+      // Matrix-vector convention CONFIRMED this pass (previously flagged best-effort/
+      // unconfirmed - now settled): the .sco's stored 3x3 is a row-major D3D matrix consumed
+      // with the D3D ROW-VECTOR convention (world_local = local * M), i.e. a local point is
+      // dotted with M's COLUMNS, not its rows (see the transform math below). Confirmed both
+      // via Ghidra (Scene_ReadEntityRecord's transform0/1/2/3 field layout, standard D3D
+      // matrix semantics) and empirically against a real multi-piece structure
+      // (russian_star_fortress.sco: wall/tower/roof pieces rendered as a scattered mess under
+      // the row-dot-vector convention, assembled into a correct symmetric star under this
+      // one) - single-piece props with rotational symmetry (trees) can't distinguish the two
+      // conventions, which is why this went unconfirmed for a while; see RULES.md #29.
+      async function buildEntityMeshes(entities) {
+        disposeEntityMeshes();
+        const myToken = ++entityBuildToken;
+
+        const visible = entities.filter(e => e.kind !== 1 && e.name);
+        const distinctNames = Array.from(new Set(visible.map(e => e.name)));
+        const geomByName = {};
+        await Promise.all(distinctNames.map(async name => {
+          geomByName[name] = await fetchMeshGeometry(name);
+        }));
+        if (myToken !== entityBuildToken) return; // superseded by a newer .sco load
+
+        const groups = new Map(); // key = entityName + '|' + pieceIndex -> {textureName, positions, normals, uvs, indices, vertBase}
+        for (const e of visible) {
+          const geo = geomByName[e.name];
+          if (!geo || !geo.pieces || !geo.pieces.length) continue;
+          const m = e.mtx, s = e.scale, p = e.pos;
+
+          for (let pi = 0; pi < geo.pieces.length; pi++) {
+            const piece = geo.pieces[pi];
+            const key = e.name + '|' + pi;
+            let group = groups.get(key);
+            if (!group) {
+              group = { textureName: piece.textureName, positions: [], normals: [], uvs: [], indices: [], vertBase: 0 };
+              groups.set(key, group);
+            }
+            const base = group.vertBase;
+            const n = piece.positions.length / 3;
+            for (let vi = 0; vi < n; vi++) {
+              // [Ghidra: fresh disasm/decompile of Scene_ReadEntityRecord (0x00564f90) +
+              // Terrain_ApplyPaintLayerEntry-adjacent D3D convention check confirmed the .sco's
+              // stored mtx is a row-major D3D matrix consumed with the ROW-VECTOR convention
+              // (v' = v*M, standard D3DX behavior for this engine) - meaning a local point's
+              // world position is v_local DOTTED WITH M's COLUMNS, not its rows. Visually
+              // confirmed: the previous row-dot-v convention scattered multi-piece structures
+              // (e.g. russian_star_fortress's wall/tower pieces) into a rotated mess instead of
+              // assembling the intended star shape; using columns fixes it.
+              const lx = piece.positions[vi * 3] * s[0];
+              const ly = piece.positions[vi * 3 + 1] * s[1];
+              const lz = piece.positions[vi * 3 + 2] * s[2];
+              const wx = m[0] * lx + m[3] * ly + m[6] * lz;
+              const wy = m[1] * lx + m[4] * ly + m[7] * lz;
+              const wz = m[2] * lx + m[5] * ly + m[8] * lz;
+              const worldX = p[0] + wx, worldY = p[1] + wy, worldZ = p[2] + wz;
+              group.positions.push(worldX, worldZ, worldY);
+
+              const nx = piece.normals[vi * 3], ny = piece.normals[vi * 3 + 1], nz = piece.normals[vi * 3 + 2];
+              const rnx = m[0] * nx + m[3] * ny + m[6] * nz;
+              const rny = m[1] * nx + m[4] * ny + m[7] * nz;
+              const rnz = m[2] * nx + m[5] * ny + m[8] * nz;
+              group.normals.push(rnx, rnz, rny);
+
+              group.uvs.push(piece.uvs[vi * 2], piece.uvs[vi * 2 + 1]);
+            }
+            for (let ii = 0; ii < piece.indices.length; ii++) group.indices.push(piece.indices[ii] + base);
+            group.vertBase += n;
+          }
+        }
+
+        for (const group of groups.values()) {
+          if (!group.indices.length) continue;
+          const idxArr = group.indices.length > 65535 ? new Uint32Array(group.indices) : new Uint16Array(group.indices);
+          entityMeshGroups.push({
+            tex: getEntityTexture(group.textureName),
+            posBuf: makeBuffer(gl.ARRAY_BUFFER, new Float32Array(group.positions)),
+            normBuf: makeBuffer(gl.ARRAY_BUFFER, new Float32Array(group.normals)),
+            uvBuf: makeBuffer(gl.ARRAY_BUFFER, new Float32Array(group.uvs)),
+            idxBuf: makeBuffer(gl.ELEMENT_ARRAY_BUFFER, idxArr),
+            idxCount: group.indices.length,
+            idxType: group.indices.length > 65535 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT,
+          });
+        }
+      }
+
+      function parseSCO(arrayBuffer) {
+	  const reader = new BinaryReader(arrayBuffer);
+
+	  try {
+	      // --- Header ---
+	      const magic = reader.readUint32();
+	      if (magic !== 0xFFFFFD33) {
+		  console.error("Invalid SCO magic number.");
+		  return null;
+	      }
+	      const version = reader.readUint32();
+	      if (version !== 4) {
+		  console.error("Invalid SCO version.");
+		  return null;
+	      }
+
+	      // --- Mission Objects ---
+	      // [Ghidra this pass: Scene_LoadSCOFile @0x00565d30 confirms the 0xFFFFFD33 magic
+	      //  and objectCount read exactly as assumed here. Scene_ReadEntityRecord
+	      //  @0x00564f90 confirms the per-record field ORDER (kind, resourceIndex, a 3rd
+	      //  int, a 3x3 rotation "transform0..2" + a "transform3" position triple, then a
+	      //  name string) matches this loop's type/id/garbage+mtx+pos+str fields - but its
+	      //  own trailing fields are read through a generic vtable stream interface
+	      //  (extra0, conditionally extra1, conditionally an "optionalVec3") gated by a
+	      //  version/count flag whose own source wasn't resolved this pass (decompiler
+	      //  couldn't resolve the controlling stack variable's initialization - see
+	      //  OPEN_QUESTIONS.md). That means the exact trailing byte count per record for
+	      //  every possible .sco version was NOT independently re-derived this session.
+	      //  Left UNCHANGED from the existing community-tool-derived (swy-sco-tools)
+	      //  fixed 8+12-byte trailer below, since it's the one part of this loop this
+	      //  session couldn't improve on with confidence and the community version is
+	      //  battle-tested against real files - flagged here rather than silently
+	      //  presented as Ghidra-confirmed.]
+	      // [Ghidra this pass: Scene_ReadEntityRecord's `kind` dispatch - kind==0 resolves
+	      //  resourceIndex via SpriteTable (static scene props/buildings), kind==2 via
+	      //  ObjectTemplateTable (also static props), kind==4 via FloraSetTable (trees/
+	      //  bushes/flora), kind==1 is a non-visual environment/lighting-influence marker
+	      //  (no mesh). We don't have the runtime SpriteTable/FloraSetTable/
+	      //  ObjectTemplateTable name tables available to this offline parser (they're
+	      //  built from other data files at game startup, not stored in the .sco itself
+	      //  beyond a raw index) - `name`/`resourceIndex` are captured as-is for approximate
+	      //  rendering (billboards for flora, boxes for props) rather than exact meshes.]
+	      const entities = [];
+	      const objectCount = reader.readUint32();
+	      for (let i = 0; i < objectCount; i++) {
+		  const kind = reader.readInt32();
+		  const resourceIndex = reader.readInt32();
+		  reader.offset += 4;       // garbage/unused
+		  const mtx = [];
+		  for (let m = 0; m < 9; m++) mtx.push(reader.readFloat32()); // mtx_a, mtx_b, mtx_c (3x3 rotation, row-major)
+		  const pos = [reader.readFloat32(), reader.readFloat32(), reader.readFloat32()];
+		  const name = reader.readRglTag();
+		  reader.offset += 8;       // entry_no (4), menu_item_no (4)
+		  const scale = [reader.readFloat32(), reader.readFloat32(), reader.readFloat32()];
+		  entities.push({ kind, resourceIndex, mtx, pos, name, scale });
+	      }
+
+	      // --- AI Mesh ---
+	      const aiMeshSectionSize = reader.readUint32();
+	      const vertexCount = reader.readUint32();
+	      reader.offset += vertexCount * 12; // 3 floats per vertex
+
+	      const edgeCount = reader.readUint32();
+	      reader.offset += edgeCount * 20;   // 5 ints per edge
+
+	      const faceCount = reader.readUint32();
+	      for (let i = 0; i < faceCount; i++) {
+		  const vtxAndEdgeCount = reader.readUint32();
+		  reader.offset += vtxAndEdgeCount * 4; // idx_vertices
+		  reader.offset += vtxAndEdgeCount * 4; // idx_edges
+		  const hasMore = reader.readUint32();
+		  if (hasMore) {
+		      reader.offset += 4; // ai_mesh_id
+		  }
+	      }
+
+	      // Check if we reached the end (interior scenes may lack terrain)
+	      if (reader.offset >= reader.dataView.byteLength) {
+		  console.warn("Terrain section not present (possibly an interior scene).");
+		  return null;
+	      }
+
+	      // --- Terrain / Ground Paint Layer section ---
+	      // [Ghidra-confirmed this pass: Terrain_LoadGroundPaintData @ 0x004fedf0 and
+	      //  Terrain_LoadGroundPaintLayer @ 0x004feb80, both cross-checked against
+	      //  independently-published .sco documentation (Swyter/mab-tools mab_sco_file.bt,
+	      //  markpryk/UnityMBToolset terrain.md) that another reverse-engineering pass on this
+	      //  same project located and verified line-by-line against the disassembly.]
+	      //
+	      // The ACTUAL in-engine terrain loader is a SEPARATE pass (a distinct stream handoff,
+	      // not literally inline in the same function as the entity-list reader above) whose
+	      // body begins DIRECTLY with numLayers/width/height - no magic number or section-size
+	      // field appears in Terrain_LoadGroundPaintData's own disassembly. We keep the
+	      // magic/size probe below only as a defensive, backward-compatible peek (some
+	      // .sco-writing tools may still emit it as an outer framing marker) - if it's not
+	      // present we simply don't consume it.
+	      const preMagicOffset = reader.offset;
+	      const maybeMagic = reader.readUint32();
+	      if (maybeMagic === 0xFF4AD1A6) {
+		  reader.readUint32(); // terrainSectionSize - not consumed by the confirmed loader itself, skip
+	      } else {
+		  reader.offset = preMagicOffset; // no magic present - rewind, header starts here
+	      }
+
+	      let numLayers = reader.readInt32();
+	      if (numLayers > 0xd) numLayers = 0xd; // [confirmed clamp: max 13 = 11 generic + elevation + leveling]
+	      const sceneWidth = reader.readInt32();
+	      const sceneHeight = reader.readInt32();
+	      if (sceneWidth > 0x1a4 || sceneHeight > 0x1a4) {
+		  // [confirmed: matches the game's own "Illegal terrain size in sco file" check, cap 420]
+		  console.error("Illegal terrain size in sco file (width/height > 420).");
+		  return null;
+	      }
+
+	      const blockCount = sceneWidth * sceneHeight;
+	      let finalHeights = new Float32Array(blockCount); // zero-init matches confirmed "empty run" default fill
+	      let elevationFound = false;
+	      const rawLayerWeights = {}; // layerIndex (0-10) -> Uint8Array(blockCount), raw /255 paint weight
+
+	      for (let i = 0; i < numLayers; i++) {
+		  // [confirmed order: type-tag/index int32, then name string, then hasCells flag]
+		  const materialIndexOrTypeTag = reader.readInt32(); // real ground-spec id (0-10), or
+		                                                      // -7793 (0xffffe18f) for elevation,
+		                                                      // or -12565 (0xffffceeb) for leveling
+		  const layerStr = reader.readRglTag();
+		  const hasCells = reader.readUint32();
+
+		  if (!hasCells) continue; // [confirmed: early-return path in Terrain_LoadGroundPaintLayer, no payload follows]
+
+		  const isElevation = (layerStr === 'ground_elevation'); // materialIndexOrTypeTag === -7793
+		  const isLeveling  = (layerStr === 'ground_leveling');  // materialIndexOrTypeTag === -12565
+		  const layerData = isElevation ? finalHeights : null;
+		  const isGenericGroundLayer = materialIndexOrTypeTag >= 0 && materialIndexOrTypeTag <= 10;
+		  let weightData = null;
+		  if (isGenericGroundLayer) {
+		      weightData = rawLayerWeights[materialIndexOrTypeTag] || (rawLayerWeights[materialIndexOrTypeTag] = new Uint8Array(blockCount));
+		  }
+
+		  // [Confirmed RLE state machine, traced by hand from Terrain_LoadGroundPaintLayer's
+		  //  disassembly this pass (Ghidra's own decompiler can't resolve this function - see
+		  //  its Ghidra comment for why): alternating empty-run / filled-run int32 counts,
+		  //  spanning the FULL width*height cell sequence in one continuous row-major stream
+		  //  (state persists across row boundaries, not reset per row).]
+		  let cellIndex = 0;
+		  while (cellIndex < blockCount) {
+		      const emptyRun = reader.readUint32();
+		      cellIndex += emptyRun;
+		      // [confirmed default fill for skipped cells: 0.0 for every layer type except
+		      //  leveling's 0xFFFFFFFF - irrelevant here since layerData is zero-initialized
+		      //  and leveling values are discarded (geometry-irrelevant) regardless]
+		      if (cellIndex >= blockCount) break;
+
+		      const filledRun = reader.readUint32();
+		      for (let j = 0; j < filledRun && cellIndex < blockCount; j++, cellIndex++) {
+			  if (materialIndexOrTypeTag < 0) {
+			      // [confirmed: raw uint32/float32 read (vtable+0x38), no /255 conversion,
+			      //  for both special (elevation/leveling) layers]
+			      if (isElevation) {
+				  layerData[cellIndex] = reader.readFloat32();
+			      } else {
+				  reader.readUint32(); // leveling ARGB color - discarded, doesn't affect geometry
+			      }
+			  } else {
+			      // [confirmed: single byte (vtable+0x50) for generic ground-spec layers 0-10,
+			      //  converted via /255 in-engine. Previously discarded here; now KEPT
+			      //  (weightData) so real ground-texture blending can use it - this is exactly
+			      //  the byte the engine itself divides by 255 for GPU blend weight.]
+			      const raw = reader.readUint8();
+			      if (weightData) weightData[cellIndex] = raw;
+			  }
+		      }
+		  }
+
+		  if (isElevation) elevationFound = true;
+	      }
+
+	      if (!elevationFound) {
+		  console.warn("No 'ground_elevation' layer in this file - terrain will show the procedural base terrain only (noise/ridges/valleys, seeded from the terrain code), with zero delta added on top - not flat, since heightBackup (the .sco's addition target) tracks the full procedural height, not a constant 0 [Ghidra: Terrain_generateTerrain/Terrain_smoothHeight both keep heightBackup in lockstep with height throughout procedural generation].");
+	      }
+
+	      // REMOVED this pass: a previous X-mirror ("M&B terrains store rows mirrored
+	      // right-to-left") applied here and a second, separate mirror in buildEntityMeshes.
+	      // [Ghidra, fresh full re-trace this pass of the entire load->build chain -
+	      // Scene_LoadSCOFile, Terrain_LoadGroundPaintData, Terrain_LoadGroundPaintLayer,
+	      // Scene_BuildTerrainForSiteAndSpawnChunkEntities (the actual loader caller -
+	      // Scene_LoadSCOFile does NOT call it directly, a previously-unverified assumption),
+	      // Terrain_Build, Terrain_ApplyPaintLayerEntry] found ZERO index reversal anywhere in
+	      // this path - every loop index (RLE cell scan, vertex-init column/row counters,
+	      // paint-apply column/row counters) runs strictly monotonically 0->N-1. The original
+	      // mirror's only justification was an empirical cross-check (entity height vs. terrain
+	      // height at mirrored vs. raw X) from an earlier session - not a Ghidra-confirmed
+	      // mechanism, and unsubstantiated by this fresh, comprehensive pass. Removing it also
+	      // fixes a real, separate bug it was causing: generateTerrain() was combining this
+	      // (mirrored) elevation delta with the procedural base heights (never mirrored, always
+	      // generated in raw col/row order) at the same flat array index - two arrays sampled
+	      // from inconsistent world-X positions, independently distorting the combined shape.
+	      return {
+		  width: sceneWidth,
+		  height: sceneHeight,
+		  heights: finalHeights,
+		  layerWeights: rawLayerWeights, // { [0-10]: Uint8Array(blockCount) } - only keys that were actually present
+		  entities,
+	      };
+
+	  } catch (e) {
+	      console.error("Error parsing .sco file. End of file reached or invalid format.", e);
+	      return null;
+	  }
+      }
+
+      // -------------------- Vertex normal computation (replaces three.js computeVertexNormals) --------------------
+      // DOCUMENTED SIMPLIFICATION: the real engine (Terrain_BuildRenderMesh) computes
+      // per-triangle geometric normals (Math_ComputeTriangleNormal) then welds/averages
+      // them per UNIQUE world position via TerrainFaceIndexGrid, plus a separate
+      // sun-visibility occlusion pass baked into vertex color - not reimplemented here.
+      // This is the same standard "sum face normals per vertex, then normalize" approach
+      // three.js's computeVertexNormals used, just hand-rolled for WebGL1.
+      function computeVertexNormals(positions, indices, vertexCount) {
+        const normals = new Float32Array(vertexCount * 3);
+        for (let i = 0; i < indices.length; i += 3) {
+          const ia = indices[i] * 3, ib = indices[i + 1] * 3, ic = indices[i + 2] * 3;
+          const ax = positions[ia], ay = positions[ia + 1], az = positions[ia + 2];
+          const bx = positions[ib], by = positions[ib + 1], bz = positions[ib + 2];
+          const cx = positions[ic], cy = positions[ic + 1], cz = positions[ic + 2];
+          const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
+          const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+          // cross(e2, e1) - NOT cross(e1,e2): for this mesh's actual triangle winding
+          // (see buildIndices - e.g. flip=0 pushes (TR,BL,TL)), cross(e1,e2) works out to
+          // point INTO the ground (verified by hand: for a flat quad this gives (0,-c^2,0)
+          // instead of (0,+c^2,0)) - confirmed as a real bug by rendering a real map and
+          // seeing near-universal wrong slope-shading/lighting even on flat ground: normal.y
+          // was negative everywhere. cross(e2,e1) is the correct sign for this winding.
+          const nx = e2y * e1z - e2z * e1y;
+          const ny = e2z * e1x - e2x * e1z;
+          const nz = e2x * e1y - e2y * e1x;
+          normals[ia] += nx; normals[ia + 1] += ny; normals[ia + 2] += nz;
+          normals[ib] += nx; normals[ib + 1] += ny; normals[ib + 2] += nz;
+          normals[ic] += nx; normals[ic + 1] += ny; normals[ic + 2] += nz;
+        }
+        for (let i = 0; i < vertexCount; i++) {
+          const p = i * 3;
+          let nx = normals[p], ny = normals[p + 1], nz = normals[p + 2];
+          const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+          normals[p] = nx / len; normals[p + 1] = ny / len; normals[p + 2] = nz / len;
+        }
+        return normals;
+      }
+
+      // Triangulation shared by terrain + water (same grid dims) - EXACT winding per
+      // Terrain_GetFaceTriangleCorners (confirmed). For a face at (faceCol,faceRow) with
+      // corners TL=(col,row) TR=(col+1,row) BL=(col,row+1) BR=(col+1,row+1):
+      //   diagonalFlipFlag==0: triangle0=(TR,BL,TL), triangle1=(TR,BR,BL)
+      //   diagonalFlipFlag==1: triangle0=(TL,TR,BR), triangle1=(TL,BR,BL)
+      // HONEST, CLEARLY-FLAGGED APPROXIMATION: the per-face flag itself is chosen by
+      // Terrain_selectFaceOrientation (procedural ground-layer classification, not
+      // reproduced this session - see file-level comment block). A fixed checkerboard
+      // pattern is used instead; this affects only which diagonal a quad is split along.
+      function buildIndices(gridW, gridH, width) {
+        const vIndex = (col, row) => row * width + col;
+        const indices = new Uint16Array(gridW * gridH * 6);
+        let p = 0;
+        for (let faceRow = 0; faceRow < gridH; faceRow++) {
+          for (let faceCol = 0; faceCol < gridW; faceCol++) {
+            const flip = (faceCol + faceRow) & 1;
+            const TL = vIndex(faceCol, faceRow);
+            const TR = vIndex(faceCol + 1, faceRow);
+            const BL = vIndex(faceCol, faceRow + 1);
+            const BR = vIndex(faceCol + 1, faceRow + 1);
+            if (flip === 0) {
+              indices[p++] = TR; indices[p++] = BL; indices[p++] = TL;
+              indices[p++] = TR; indices[p++] = BR; indices[p++] = BL;
+            } else {
+              indices[p++] = TL; indices[p++] = TR; indices[p++] = BR;
+              indices[p++] = TL; indices[p++] = BR; indices[p++] = BL;
+            }
+          }
+        }
+        return indices;
+      }
+
+      // -------------------- GPU mesh state --------------------
+      let terrainMeshGL = null; // { posBuf, normBuf, w0Buf, w1Buf, idxBuf, idxCount }
+      let waterMeshGL = null;   // { posBuf, depthBuf, idxBuf, idxCount } or null
+      let activeLayerIndices = []; // which of GROUND_LAYERS[] are bound to units 0-7 for the current mesh
+
+      function disposeMesh(m) {
+        if (!m) return;
+        gl.deleteBuffer(m.posBuf);
+        if (m.normBuf) gl.deleteBuffer(m.normBuf);
+        if (m.shadowBuf) gl.deleteBuffer(m.shadowBuf);
+        if (m.w0Buf) gl.deleteBuffer(m.w0Buf);
+        if (m.w1Buf) gl.deleteBuffer(m.w1Buf);
+        if (m.depthBuf) gl.deleteBuffer(m.depthBuf);
+        if (m.idxBuf) gl.deleteBuffer(m.idxBuf);
+      }
+
+      function makeBuffer(target, data) {
+        const buf = gl.createBuffer();
+        gl.bindBuffer(target, buf);
+        gl.bufferData(target, data, gl.STATIC_DRAW);
+        return buf;
+      }
+
+      // 4. Read file
+      let globalScoData = null;  // Caches loaded SCO data for real-time adjustments
+      let terrainGridW = 0, terrainGridH = 0, terrainWidth = 0, terrainCellSize = 2;
+
+      // ==========================================================================
+      // EXACT procedural ground-layer system, ported from Ghidra decompilation this
+      // session. This is NOT an approximation - every function below has a cited
+      // decompiled source and was verified against the live Ghidra database's exact
+      // struct offsets before being written.
+      //
+      // Ground truth chain (Terrain_Build @ 0x00510ee0, fully decompiled, confirmed
+      // UNCONDITIONAL call order - this runs for every terrain build, loaded .sco or
+      // not):
+      //   Terrain_generateLayers -> ... -> Terrain_computeVertexLayerIntensities ->
+      //   ... -> [.sco paint applied here, if present] -> Terrain_computeFaceLayerIntensities
+      //
+      // This resolves why a .sco with ZERO paint layers (like the real user-supplied
+      // "REVAN" map) still shows varied ground in-game: the procedural layer system
+      // below runs regardless, painting slope-based/noise-based ground variation that
+      // the previous version of this file never implemented at all.
+      // ==========================================================================
+
+      function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+
+      // Must match the uLightDir uniform value set in draw() below. Real per-scene light
+      // direction/color come from placed light entities (Light_AccumulateDirectionAndColorAtPoint,
+      // confirmed this session - see plan item #6) - not wired up yet, so this fixed
+      // directional-light approximation (unchanged from before this pass) is reused for the
+      // self-shadow raycast too, for consistency between the shadow term and the lit term.
+      const DEFAULT_LIGHT_DIR = [0.4, -0.8, 0.3];
+
+      // [Ghidra: Terrain_generateLayers @ 0x004ff5a0, this session, fully decompiled]
+      // EXACT region-type -> procedural-material-slot switch table. Material indices
+      // match g_abGroundMaterialTable's order, which is ground_specs.txt's own order
+      // (0=gray_stone,1=brown_stone,2=turf,3=steppe,4=snow,5=earth,6=desert,7=forest,
+      // 8=pebbles,9=village,10=path) - confirmed via GROUND_LAYERS above already using
+      // this same order for the .sco paint-layer indices, which are the SAME material
+      // ID space (aPaintLayerSlots[4..14] = explicit .sco paint; aPaintLayerSlots[0..3]
+      // = these procedural slots - both index into the same 11-entry material table).
+      // slot1 = base/"region" material (always assigned). slot2 = optional secondary
+      // material, -1 = none. bias = flTerrainRidgeAmplitudeBiasSelector (confirmed
+      // literal constants: 0.19 default, 0.26 only for desert/desert_forest).
+      function getRegionMaterialSlots(regionType) {
+        switch (regionType) {
+          case 2:  return { slot1: 5, slot2: 3, bias: 0.19 };        // steppe
+          case 4:  case 12: return { slot1: 4, slot2: -1, bias: 0.19 }; // snow / snow_forest (0xc aliases 4, confirmed identical case arm)
+          case 5:  case 13: return { slot1: 6, slot2: -1, bias: 0.26 }; // desert / desert_forest (0xd aliases 5, confirmed identical case arm)
+          case 10: return { slot1: 7, slot2: 3, bias: 0.19 };        // steppe_forest
+          case 11: return { slot1: 7, slot2: 2, bias: 0.19 };        // forest
+          default: return { slot1: 5, slot2: 2, bias: 0.19 };        // ocean/mountain/plain/bridge/river/mountain_forest
+        }
+      }
+
+      // [Ghidra: Terrain_computeVertexLayerIntensities @ 0x005007d0, this session,
+      // fully decompiled] EXACT per-vertex procedural weight formula:
+      //   slopeFade = clamp01(((1 - normalY) - bias) * 12.0)
+      //   layer0Weight (region base material) = 1 - slopeFade
+      //   [if region has a slot2 material:]
+      //   patchValue = clamp01((noise0+noise1+noise2)*4.5 + 0.7), via
+      //     rglPerlinOctave(15.0, 0.6, 3, 0, col, row, 0.0) - raw grid coords, no
+      //     world-scale/offset, confirmed exact call signature from the disassembly.
+      //   layer1Weight (secondary) = patchValue * layer0Weight; if patchValue>0.99,
+      //     layer0Weight is zeroed (secondary fully replaces base at that vertex).
+      // normalY here is engine normalZ (Z-up) = this renderer's Y-up normal.y, already
+      // established equivalence this session.
+      function computeVertexLayerWeights(normalY, col, row, regionSlots) {
+        const slopeFade = clamp01(((1.0 - normalY) - regionSlots.bias) * 12.0);
+        let layer0Weight = 1.0 - slopeFade;
+        let layer1Weight = 0.0;
+        if (regionSlots.slot2 >= 0) {
+          const n = rglPerlinOctave(15.0, 0.6, 3, 0, col, row, 0.0);
+          const patchValue = clamp01((n[0] + n[1] + n[2]) * 4.5 + 0.7);
+          layer1Weight = patchValue * layer0Weight;
+          if (patchValue > 0.99) layer0Weight = 0.0;
+        }
+        return [layer0Weight, layer1Weight];
+      }
+
+      // [Ghidra: Terrain_computeFaceLayerIntensities @ 0x00500e70, this session, fully
+      // decompiled, cross-checked against live get_struct_layout for both TerrainFace
+      // and TerrainVertex to confirm exact byte offsets] EXACT per-face "over" alpha
+      // composite across the face's 4 corners (0.25 weight each - NOT a normalized
+      // average, a real front-to-back composite where higher-priority channels
+      // (processed first) occlude lower ones):
+      //   for each corner: remaining=1.0; for channel i from 14 downto 0:
+      //     faceChannel[i] += remaining * vertexChannel[i] * 0.25
+      //     remaining -= remaining * vertexChannel[i]
+      // 15 channels, index order matching TerrainVertex's own contiguous 15-float run
+      // (confirmed via exact struct offsets: vertex byte 0x48..0x80, a constant -20
+      // byte/-5-float offset from TerrainFace's matching byte 0x34..0x6c run):
+      //   [0]=field_0x48 (always 1.0 - the "whatever's left over" fallback, processed
+      //       LAST/lowest-priority since compositing runs high-index-first)
+      //   [1]=layer0Weight (region base material)
+      //   [2]=layer1Weight (region secondary material)
+      //   [3]=waterMarker
+      //   [4..14]=aExtraLayerWeightSlots[0..10] (the 11 explicit .sco paint layers)
+      // THIS EXACTLY RESOLVES TerrainFace's own long-standing open unk34..unk58 fields
+      // (10 dwords, unresolved ~15 prior sessions per OPEN_QUESTIONS.md/COMPLETED_WORK.md):
+      // they are channels [0..9] of this SAME 15-channel run (fallback, regionBase,
+      // regionSecondary, water, paint0..paint5), with the already-named
+      // layerIntensity0..4 being channels [10..14] (paint6..paint10).
+      function compositeFaceChannels(cornerChannels) {
+        const result = new Float32Array(15);
+        for (let c = 0; c < 4; c++) {
+          let remaining = 1.0;
+          const ch = cornerChannels[c];
+          for (let i = 14; i >= 0; i--) {
+            const w = ch[i];
+            result[i] += remaining * w * 0.25;
+            remaining -= remaining * w;
+          }
+        }
+        return result;
+      }
+      // Same "over" composite as compositeFaceChannels above, applied at a single vertex
+      // (corner weight 1.0 instead of 4 corners at 0.25 each - algebraically identical to
+      // calling compositeFaceChannels with the same channel array 4 times, since each
+      // corner's own `remaining` resets to 1.0 independently). Used for SMOOTH per-vertex
+      // GPU-interpolated blending instead of the flat per-face version: the per-face
+      // version is a real, Ghidra-confirmed algorithm (Terrain_computeFaceLayerIntensities
+      // literally is per-face), but rendering it as flat per-face texture weight on a
+      // duplicated-vertex mesh produced hard blend-weight discontinuities at every face
+      // boundary - visibly blocky, not the smooth blending the real game shows. Per-vertex
+      // weights on a SHARED/indexed mesh let GLSL's automatic attribute interpolation
+      // blend smoothly across triangles and across shared edges - the standard terrain-
+      // splatting technique, and a principled choice given the real GPU-side consumption
+      // mechanism for these weights is still unlocated (see OPEN_QUESTIONS.md).
+      function compositeVertexChannels(ch) {
+        const result = new Float32Array(15);
+        let remaining = 1.0;
+        for (let i = 14; i >= 0; i--) {
+          const w = ch[i];
+          result[i] = remaining * w;
+          remaining -= remaining * w;
+        }
+        return result;
+      }
+
+      // Self-shadow test: marches from each grid vertex toward the light, bilinearly
+      // sampling the real loaded heightmap, matching the STRUCTURE of
+      // Terrain_ComputeVertexSunVisibilityMask -> ..._SingleVertexRaycast (0x00505770)
+      // -> TerrainHeightGrid_QuickRayOcclusionTest (heightmap raycast against the
+      // engine's OWN terrain, confirmed this session) - the exact step/bias constants
+      // of the real raycast were not decompiled, so this uses cellSize-sized steps
+      // (matches the heightmap's own resolution, no finer sampling has any real
+      // information to use) and a small bias to avoid self-shadowing artifacts; this
+      // one specific numeric choice is flagged as not Ghidra-derived, unlike everything
+      // else in this block. Output is the confirmed binary 0.1/1.0 factor (never fully
+      // black), per Terrain_ComputeVertexSunVisibility_LightmapTexelBake's formula.
+      function sampleHeightBilinear(heights, width, height, gx, gz) {
+        gx = Math.max(0, Math.min(width - 1.001, gx));
+        gz = Math.max(0, Math.min(height - 1.001, gz));
+        const x0 = Math.floor(gx), z0 = Math.floor(gz);
+        const x1 = x0 + 1, z1 = z0 + 1;
+        const fx = gx - x0, fz = gz - z0;
+        const h00 = heights[z0 * width + x0], h10 = heights[z0 * width + x1];
+        const h01 = heights[z1 * width + x0], h11 = heights[z1 * width + x1];
+        return h00 * (1 - fx) * (1 - fz) + h10 * fx * (1 - fz) + h01 * (1 - fx) * fz + h11 * fx * fz;
+      }
+      function computeSelfShadowFactors(heights, width, height, cellSize, lightDir) {
+        const out = new Float32Array(width * height);
+        const dirX = -lightDir[0], dirY = -lightDir[1], dirZ = -lightDir[2];
+        const horizLen = Math.hypot(dirX, dirZ) || 1e-6;
+        const maxSteps = 48;
+        for (let row = 0; row < height; row++) {
+          for (let col = 0; col < width; col++) {
+            const i = row * width + col;
+            const startH = heights[i];
+            let occluded = false;
+            if (dirY > 1e-4) { // only meaningful if the light points upward from here (i.e. marching toward it goes up)
+              let gx = col, gz = row, y = startH + 0.05;
+              // step in world units of one cellSize horizontally, matching scaled Y rise per step
+              const stepScale = cellSize / horizLen;
+              for (let s = 0; s < maxSteps; s++) {
+                gx += dirX * stepScale / cellSize;
+                gz += dirZ * stepScale / cellSize;
+                y += dirY * stepScale;
+                if (gx < 0 || gx > width - 1 || gz < 0 || gz > height - 1) break;
+                const terrainY = sampleHeightBilinear(heights, width, height, gx, gz);
+                if (terrainY > y + 0.02) { occluded = true; break; }
+              }
+            }
+            out[i] = occluded ? 0.1 : 1.0;
+          }
+        }
+        return out;
+      }
+
+      function generateTerrain(scoData) {
+	  if (!scoData) return;
+
+	  // MANDATORY: cellSize is encoded directly in the terrain code's Region Detail
+	  // field (key 5, bits 2-3; cellSize = value+2) - see terrain(1).md and the
+	  // parseTerrainCode() comment above. It is NOT reliably recoverable from a
+	  // separate global scenes.txt bounding-box lookup, so a real .sco cannot be
+	  // rendered without its own terrain code loaded first.
+	  if (!currentTerrainCode) {
+              const status = document.getElementById('terrainCodeStatus');
+              if (status) { status.textContent = 'Cannot render: load this scene\'s terrain code (.txt) first - cell size is not guessable.'; status.style.color = '#f88'; }
+              console.error('generateTerrain: refusing to render without a loaded terrain code (cellSize would have to be guessed).');
+              return;
+	  }
+
+	  disposeMesh(terrainMeshGL); terrainMeshGL = null;
+	  disposeMesh(waterMeshGL); waterMeshGL = null;
+	  disposeEntityMeshes();
+
+	  // scoData.width/height are the FILE's stored grid dims, which equal
+	  // gridWidthMinusOne+1 / gridHeightMinusOne+1 in the engine's own terms
+	  // [Ghidra: Terrain_LoadGroundPaintData confirmed this + Terrain_ApplyPaintLayerEntry's
+	  //  loop bounds independently corroborate the +1 relationship].
+	  const { width, height, heights: elevationDelta } = scoData;
+	  const gridW = width - 1;  // == terrain->gridWidthMinusOne
+	  const gridH = height - 1; // == terrain->gridHeightMinusOne
+
+	  // EXACT: cellSize = regionDetail + 2, decoded directly from the terrain code
+	  // (parseTerrainCode above), per terrain(1).md and cross-checked against
+	  // Swyter/mab-tools' independent terrain-code generator, and this session's own
+	  // direct Ghidra re-derivation (see parseTerrainCode's comment).
+	  const cellSize = currentTerrainCode.cellSize;
+	  if (currentTerrainCode.numFacesX !== gridW || currentTerrainCode.numFacesY !== gridH) {
+              // NOT a refusal: cross-checked against the real shipped scenes.txt (Server/Dedicated),
+              // this mismatch is GENUINE for some real maps (e.g. scn_mp_fort_george and scn_mp_naval
+              // both ship a terrain code implying a different grid than their own .sco's actual grid -
+              // confirmed authentic, not a bad pairing) - the .sco's own grid dims are authoritative
+              // regardless. Only cellSize/seed/region/hillHeight come from the terrain code.
+              console.warn(`Terrain code implies a ${currentTerrainCode.numFacesX}x${currentTerrainCode.numFacesY}-face grid but the loaded .sco has ${gridW}x${gridH} faces - they may be from different scenes. Using cellSize=${cellSize}m from the terrain code and the .sco's own grid dimensions/heights regardless.`);
+	  }
+
+	  const vIndex = (col, row) => row * width + col; // matches parseSCO's row-major heights[] layout
+
+	  // === EXACT procedural HEIGHT pipeline, re-verified via fresh full-disassembly this pass
+	  // (not decompiler paraphrase - see the project's plan/COMPLETED_WORK.md for the specific
+	  // bugs this replaces: RNG desync across the generateLayers/generateTerrain boundary,
+	  // wrong Perlin output component + swapped orientation in the border-ridge pass, and two
+	  // entirely-missing procedural steps). [Ghidra: Terrain_Build @ 0x00510ee0] confirmed
+	  // unconditional order:
+	  //   seed0 -> Terrain_generateLayers's draws -> Terrain_generateTerrain (noise/ridge/valley)
+	  //   -> seed1 -> Terrain_generateRiver (1 draw even with no river) -> Terrain_smoothHeight
+	  //   -> Terrain_computeNormals -> Terrain_computeVertexLayerIntensities (no RNG) ->
+	  //   Terrain_roughenRockVertices -> [HERE heightBackup is finally complete] ->
+	  //   Terrain_ApplyPaintLayerEntry's elevation branch: z = heightBackup + paintedElevationDelta.
+	  // ONE continuous g_terrainRngState stream throughout - previously this file called
+	  // setSeed(seed0) twice independently (once for a stray stone-material draw, once inside
+	  // generateTerrainHeightmap), which desyncs a multiplicative LCG completely (not "slightly")
+	  // from the first reset onward.
+	  setSeed(currentTerrainCode.seed0);
+	  const stoneMaterial = (lcgNext() >>> 16) & 1;                 // draw1: aPaintLayerSlots[0] coinflip (0=gray_stone,1=brown_stone)
+	  lcgNext();                                                     // draw2: unconditional (Terrain_generateLayers) - result not visibly consumed but must be drawn
+	  if (currentTerrainCode.regionType === 2) lcgNext();             // draw3: steppe-only (Terrain_generateLayers) - likewise must be drawn to stay in sync
+	  const regionSlots = getRegionMaterialSlots(currentTerrainCode.regionType);
+
+	  const proceduralBase = generateTerrainHeightmap(gridW, gridH, cellSize, currentTerrainCode.hillHeight, currentTerrainCode.vegetation); // continues the SAME stream, does not reseed
+
+	  setSeed(currentTerrainCode.seed1); // [Ghidra: Terrain_Build] reseed to rngSeedSourceB before generateRiver
+	  lcgNext(); // Terrain_generateRiver's one unconditional draw (confirmed via fresh disassembly: burned even on the immediate-reject no-river path) - full river carving stays out of scope, but this draw must happen to keep smoothHeight's per-vertex jitter in sync
+
+	  const smoothedHeights = smoothHeightPass(proceduralBase.heights, width, height);
+
+	  // computeNormals -> computeVertexLayerIntensities, BOTH confirmed to run BEFORE the .sco's
+	  // elevation delta applies - i.e. layer0Weight/layer1Weight (the slope-based procedural
+	  // ground-material weights) are computed from the smooth PRE-carving terrain, not the final
+	  // letters-carved-in geometry. This is a real, confirmed ordering (not a simplification),
+	  // though its implication for ground TEXTURE blending on maps with large elevation deltas
+	  // is a separate open question from this pass's HEIGHT-only scope - see OPEN_QUESTIONS.md.
+	  const prePaintPositions = new Float32Array(width * height * 3);
+	  for (let row = 0; row < height; row++) {
+              for (let col = 0; col < width; col++) {
+		  const p = vIndex(col, row) * 3;
+		  prePaintPositions[p] = col * cellSize;
+		  prePaintPositions[p + 1] = smoothedHeights[vIndex(col, row)];
+		  prePaintPositions[p + 2] = row * cellSize;
+              }
+	  }
+	  const prePaintIndices = buildIndices(gridW, gridH, width);
+	  const prePaintNormals = computeVertexNormals(prePaintPositions, prePaintIndices, width * height);
+
+	  const layer0WeightArr = new Float32Array(width * height);
+	  const layer1WeightArr = new Float32Array(width * height);
+	  for (let row = 0; row < height; row++) {
+              for (let col = 0; col < width; col++) {
+		  const i = vIndex(col, row);
+		  const [l0, l1] = computeVertexLayerWeights(prePaintNormals[i * 3 + 1], col, row, regionSlots);
+		  layer0WeightArr[i] = l0; layer1WeightArr[i] = l1;
+              }
+	  }
+
+	  const roughenedHeights = roughenRockVerticesPass(smoothedHeights, layer0WeightArr, layer1WeightArr, width, height, cellSize);
+
+	  // heightBackup is now complete (noise+ridge+valley+smooth+roughen) - add the .sco's own
+	  // saved elevation delta on top, exactly matching Terrain_ApplyPaintLayerEntry's confirmed
+	  // `z = heightBackup + paintedElevationDelta`.
+	  const heights = new Float32Array(width * height);
+	  for (let i = 0; i < heights.length; i++) heights[i] = roughenedHeights[i] + elevationDelta[i];
+	  window.__debugHeights = { proceduralBase: proceduralBase.heights, smoothedHeights, roughenedHeights, elevationDelta, combined: heights };
+
+	  if (scoData.entities && scoData.entities.length) {
+              buildEntityMeshes(scoData.entities);
+	  }
+
+	  terrainGridW = gridW; terrainGridH = gridH; terrainWidth = width; terrainCellSize = cellSize;
+
+	  // --- Vertex positions: EXACT per Terrain_Build's confirmed formula, using the FINAL
+	  // (post-delta) heights - this is the actually-rendered geometry. ---
+	  const positions = new Float32Array(width * height * 3);
+	  for (let row = 0; row < height; row++) {
+              for (let col = 0; col < width; col++) {
+		  const p = vIndex(col, row) * 3;
+		  positions[p]     = col * cellSize;
+		  positions[p + 1] = heights[vIndex(col, row)];
+		  positions[p + 2] = row * cellSize;
+              }
+	  }
+
+	  const sharedIndices = buildIndices(gridW, gridH, width);
+	  const sharedNormals = computeVertexNormals(positions, sharedIndices, width * height);
+
+	  // --- EXACT ground-layer weight composition (see file-level comment block above). Reuses
+	  // layer0WeightArr/layer1WeightArr already computed above (pre-paint, per the confirmed
+	  // Terrain_Build order) rather than recomputing from the post-delta normals. waterMarker
+	  // likewise uses the pre-delta (roughened) height, matching Terrain_computeVertexLayerIntensities's
+	  // own confirmed place in the call order (before the elevation delta applies). ---
+	  const vertexChannels = new Float32Array(width * height * 15);
+	  for (let row = 0; row < height; row++) {
+              for (let col = 0; col < width; col++) {
+		  const i = vIndex(col, row);
+		  const layer0Weight = layer0WeightArr[i], layer1Weight = layer1WeightArr[i];
+		  const waterMarker = (currentTerrainCode.placeRiver && roughenedHeights[i] < 0.0) ? 1.0 : 0.0;
+		  const base = i * 15;
+		  // field_0x48, always-1.0 fallback: confirmed (Terrain_InitVertex) to never be
+		  // conditionally written, and the LOWEST-priority ("over"-composited last)
+		  // channel - i.e. it's aPaintLayerSlots[0]'s (stone's) own coverage, showing
+		  // through wherever every higher-priority channel (paint layers, water,
+		  // region secondary, region base) leaves coverage unclaimed. On flat ground
+		  // that's almost nothing (earth/turf claim ~all of it); on steep slopes
+		  // layer0Weight/layer1Weight collapse toward 0 via the slope-fade term, so
+		  // stone dominates - this is what paints steep sculpted terrain as rock.
+		  vertexChannels[base + 0] = 1.0;
+		  vertexChannels[base + 1] = layer0Weight;    // region base material
+		  vertexChannels[base + 2] = layer1Weight;    // region secondary material
+		  vertexChannels[base + 3] = waterMarker;
+		  for (let p = 0; p < 11; p++) {
+		      const arr = scoData.layerWeights ? scoData.layerWeights[p] : null;
+		      vertexChannels[base + 4 + p] = arr ? arr[i] / 255 : 0.0;
+		  }
+              }
+	  }
+
+	  window.__debugVertexChannels = { vertexChannels, width, height };
+
+	  // --- Self-shadow (see computeSelfShadowFactors above) ---
+	  const shadowFactors = computeSelfShadowFactors(heights, width, height, cellSize, DEFAULT_LIGHT_DIR);
+
+	  // --- Determine which material indices to bind to the 8 available texture units ---
+	  // unit0=stone (channel 0, the random gray_stone/brown_stone undercoat - see above),
+	  // unit1=regionBase (folds in water, channels 1+3), unit2=regionSecondary (channel 2,
+	  // only if the region has one) - these are the ALWAYS-present procedural materials.
+	  // Remaining units go to whichever explicit .sco paint layers (channels 4-14) are
+	  // actually present, ranked by total weight (documented simplification only if a file
+	  // pathologically uses more than the remaining unit count - rare).
+	  const presentPaint = [];
+	  for (let p = 0; p < 11; p++) if (scoData.layerWeights && scoData.layerWeights[p]) presentPaint.push(p);
+	  let paintTotals = presentPaint.map(p => {
+              let sum = 0; const arr = scoData.layerWeights[p];
+              for (let i = 0; i < arr.length; i++) sum += arr[i];
+              return { p, sum };
+	  });
+	  paintTotals.sort((a, b) => b.sum - a.sum);
+
+	  const unitMaterial = [stoneMaterial, regionSlots.slot1]; // unit0=stone, unit1=regionBase
+	  const unitChannel = [0, 1];
+	  if (regionSlots.slot2 >= 0) { unitMaterial.push(regionSlots.slot2); unitChannel.push(2); }
+	  const maxUnits = 8;
+	  const proceduralUnitCount = unitMaterial.length;
+	  for (const { p } of paintTotals) {
+              if (unitMaterial.length >= maxUnits) break;
+              unitMaterial.push(p);
+              unitChannel.push(4 + p);
+	  }
+	  if (paintTotals.length > maxUnits - proceduralUnitCount) {
+              console.warn(`.sco uses more distinct ground paint layers than available texture units; some low-weight layers are dropped from rendering (their weight is folded into the region base material instead).`);
+	  }
+	  activeLayerIndices = unitMaterial;
+
+	  // --- Build SMOOTH per-vertex weights on the SHARED/indexed mesh (see
+	  // compositeVertexChannels' comment for why: flat per-face weights on a duplicated-
+	  // vertex mesh looked blocky, not smooth like the real game). ---
+	  const weights0 = new Float32Array(width * height * 4);
+	  const weights1 = new Float32Array(width * height * 4);
+	  for (let i = 0; i < width * height; i++) {
+              const vch = compositeVertexChannels(vertexChannels.subarray(i * 15, i * 15 + 15));
+              const o4 = i * 4;
+              weights0[o4] = vch[0];             // unit0: stone
+              weights0[o4 + 1] = vch[1] + vch[3]; // unit1: regionBase + water folded in
+              for (let u = 2; u < unitMaterial.length; u++) {
+		  const w = vch[unitChannel[u]] || 0;
+		  if (u < 4) weights0[o4 + u] = w; else weights1[o4 + (u - 4)] = w;
+              }
+	  }
+
+	  const idxBuf = makeBuffer(gl.ELEMENT_ARRAY_BUFFER, sharedIndices);
+	  terrainMeshGL = {
+              posBuf: makeBuffer(gl.ARRAY_BUFFER, positions),
+              normBuf: makeBuffer(gl.ARRAY_BUFFER, sharedNormals),
+              shadowBuf: makeBuffer(gl.ARRAY_BUFFER, shadowFactors),
+              w0Buf: makeBuffer(gl.ARRAY_BUFFER, weights0),
+              w1Buf: makeBuffer(gl.ARRAY_BUFFER, weights1),
+              idxBuf,
+              idxCount: sharedIndices.length,
+	  };
+
+	  // --- Water plane ---
+	  // DOCUMENTED SIMPLIFICATION (see waterFS comment above): a plane at the scene's
+	  // global water_level, sized to the terrain's world bounds. Does NOT trace an
+	  // actual river's path (Terrain_generateRiver/River_WalkPath not ported this
+	  // session).
+	  if (currentTerrainCode.waterLevel !== null && document.getElementById('showWaterToggle').checked) {
+              const waterPositions = new Float32Array(width * height * 3);
+              const depths = new Float32Array(width * height);
+              for (let row = 0; row < height; row++) {
+		  for (let col = 0; col < width; col++) {
+		      const i = vIndex(col, row);
+		      const p = i * 3;
+		      waterPositions[p]     = col * cellSize;
+		      waterPositions[p + 1] = currentTerrainCode.waterLevel;
+		      waterPositions[p + 2] = row * cellSize;
+		      depths[i] = Math.max(0, currentTerrainCode.waterLevel - heights[i]);
+		  }
+              }
+              waterMeshGL = {
+		  posBuf: makeBuffer(gl.ARRAY_BUFFER, waterPositions),
+		  depthBuf: makeBuffer(gl.ARRAY_BUFFER, depths),
+		  idxBuf: makeBuffer(gl.ELEMENT_ARRAY_BUFFER, sharedIndices),
+		  idxCount: sharedIndices.length,
+              };
+	  }
+      }
+
+      // Toggling water visibility / texture visibility just re-runs generateTerrain() on
+      // the cached data, since it already owns creating/disposing meshes each call.
+      document.getElementById('showWaterToggle').addEventListener('change', function() {
+	  if (globalScoData) generateTerrain(globalScoData);
+      });
+      let useTexturesFlag = true;
+      document.getElementById('showTexturesToggle').addEventListener('change', function(e) {
+          useTexturesFlag = e.target.checked;
+      });
+      let showEntitiesFlag = true;
+      document.getElementById('showEntitiesToggle').addEventListener('change', function(e) {
+          showEntitiesFlag = e.target.checked;
+      });
+
+      // Minimize/restore the UI panel (collapses to just the header bar).
+      document.getElementById('uiToggleBtn').addEventListener('click', function() {
+	  const panel = document.getElementById('ui');
+	  const collapsed = panel.classList.toggle('collapsed');
+	  this.innerHTML = collapsed ? '&#43;' : '&#8211;';
+	  this.title = collapsed ? 'Restore' : 'Minimize';
+      });
+
+      // Listener: parse the mandatory terrain-code file (a scenes.txt line, or a bare
+      // 0x... code). Populates currentTerrainCode directly from the bitfield - no
+      // bounding-box guessing, no cross-scene lookup table.
+      document.getElementById('txtInput').addEventListener('change', function(event) {
+	  const file = event.target.files[0];
+	  if (!file) return;
+
+	  const reader = new FileReader();
+	  reader.onload = function(e) {
+	      const text = e.target.result;
+	      const parsed = parseTerrainCode(text);
+	      const status = document.getElementById('terrainCodeStatus');
+	      const genBtn = document.getElementById('procGenBtn');
+
+	      if (!parsed) {
+		  currentTerrainCode = null;
+		  if (status) { status.textContent = 'Could not find a 0x... terrain code in that file.'; status.style.color = '#f88'; }
+		  if (genBtn) { genBtn.disabled = true; genBtn.textContent = 'Generate procedural base (load terrain code first)'; }
+		  console.error('parseTerrainCode failed for uploaded file.');
+		  return;
+	      }
+
+	      currentTerrainCode = parsed;
+	      console.log('Parsed terrain code', parsed.raw, parsed);
+
+	      if (status) {
+		  status.style.color = '#8f8';
+		  status.innerHTML = `Loaded: cellSize=${parsed.cellSize}m, grid=${parsed.numFacesX}x${parsed.numFacesY} faces ` +
+		      `(${parsed.worldSizeX}x${parsed.worldSizeY}m), region=${parsed.regionTypeName}, ` +
+		      `hillHeight=${parsed.hillHeight}, ruggedness=${parsed.ruggedness}, valley=${(parsed.valley/100).toFixed(2)}, ` +
+		      `vegetation=${(parsed.vegetation/100).toFixed(2)}, seeds=[${parsed.seed0},${parsed.seed1},${parsed.seed2}], ` +
+		      `placeRiver=${parsed.placeRiver}, deepWater=${parsed.deepWater}, disableGrass=${parsed.disableGrass}, ` +
+		      `shadeOccluded=${parsed.shadeOccluded}`;
+	      }
+
+	      // Pre-fill the procedural generator's fields from the loaded code so it
+	      // reproduces the same scene by default (still overridable by hand).
+	      document.getElementById('procSeed').value = parsed.seed0;
+	      document.getElementById('procGridW').value = parsed.numFacesX;
+	      document.getElementById('procGridH').value = parsed.numFacesY;
+	      document.getElementById('procCellSize').value = parsed.cellSize;
+	      document.getElementById('procHillHeight').value = parsed.hillHeight;
+	      if (genBtn) { genBtn.disabled = false; genBtn.textContent = 'Generate procedural base'; }
+
+	      // If a .sco was already loaded, it can now be rendered (or re-rendered with
+	      // the correct cellSize if it was loaded before the terrain code).
+	      if (globalScoData) generateTerrain(globalScoData);
+	  };
+	  reader.readAsText(file);
+      });
+
+      document.getElementById('scoInput').addEventListener('change', function(event) {
+	  const file = event.target.files[0];
+	  if (!file) return;
+
+	  const fileReader = new FileReader();
+
+	  fileReader.onload = function(e) {
+	      const arrayBuffer = e.target.result;
+	      console.log("File loaded, size:", arrayBuffer.byteLength, "bytes");
+
+	      const scoData = parseSCO(arrayBuffer);
+
+	      globalScoData = scoData; // Cache the data globally
+	      generateTerrain(scoData); // will refuse and show a status message if currentTerrainCode isn't loaded yet
+	  };
+
+	  fileReader.readAsArrayBuffer(file);
+      });
+
+      document.getElementById('procGenBtn').addEventListener('click', function() {
+          if (!currentTerrainCode) return; // button is disabled in this state, but guard anyway
+          const seedA = parseInt(document.getElementById('procSeed').value, 10) || 0;
+          const gridW = parseInt(document.getElementById('procGridW').value, 10) || 100;
+          const gridH = parseInt(document.getElementById('procGridH').value, 10) || 100;
+          const cellSize = parseFloat(document.getElementById('procCellSize').value) || 2.0;
+          const hillHeight = parseInt(document.getElementById('procHillHeight').value, 10) || 0;
+          // Preview button: generateTerrain() always regenerates its own procedural base
+          // internally (per the confirmed Terrain_Build order) and ADDS scoData.heights as a
+          // paint-layer ELEVATION DELTA on top - it is not itself a full height field. This
+          // button has no .sco to source a delta from, so it must feed an all-zero delta (not
+          // generateTerrainHeightmap()'s own output, which is an ABSOLUTE height field - passing
+          // that here as if it were a delta silently double-stacked two independent procedural
+          // terrains, which is exactly the "terrain generator rendered over the map" bug).
+          // Overrides seed0/hillHeight/cellSize on a CLONE of currentTerrainCode (keeps
+          // region/seed1/river fields from whatever real terrain code is loaded) so
+          // generateTerrain()'s own seeding/generateLayers/height pipeline runs unmodified.
+          currentTerrainCode = Object.assign({}, currentTerrainCode, { seed0: seedA, hillHeight, cellSize });
+          const width = gridW + 1, height = gridH + 1;
+          globalScoData = {
+              width, height,
+              heights: new Float32Array(width * height), // zero delta -> shows the procedural base as-is
+              layerWeights: null,
+              entities: [],
+          };
+          generateTerrain(globalScoData);
+          console.log("Generated procedural base preview, seed0=" + seedA + ", hillHeight=" + hillHeight + ", cellSize=" + cellSize + "m.");
+      });
+
+      // 5. Camera / Input & Movement (WASD + Mouse Rotation + Zoom)
+      // Hand-rolled replacement for three.js's PerspectiveCamera + translateZ/X, matching
+      // the original control scheme exactly (yaw/pitch Euler angles, movement relative to
+      // the camera's full 3D facing direction including pitch, so looking up/down while
+      // pressing W also moves you up/down - same behavior the old camera.translateZ gave).
+      const camera = { pos: [0, 50, 100], yaw: 0, pitch: 0 };
+      // Face the origin initially, matching the old camera.lookAt(0,0,0) from position (0,50,100).
+      camera.yaw = Math.atan2(-camera.pos[0], -camera.pos[2]) + Math.PI;
+      camera.pitch = -Math.atan2(camera.pos[1], Math.hypot(camera.pos[0], camera.pos[2])); // negative pitch = looking down, per mat4RotateX's rotation direction (verified empirically: unnegated, the camera looked up and over the terrain instead of at it)
+
+      function cameraBasis() {
+        const rot = mat4Multiply(mat4RotateY(camera.yaw), mat4RotateX(camera.pitch));
+        return {
+          forward: transformDir(rot, [0, 0, -1]),
+          right: transformDir(rot, [1, 0, 0]),
+        };
+      }
+      function viewMatrix() {
+        const rot = mat4Multiply(mat4RotateX(-camera.pitch), mat4RotateY(-camera.yaw));
+        return mat4Multiply(rot, mat4Translate(-camera.pos[0], -camera.pos[1], -camera.pos[2]));
+      }
+
+      const keys = { w: false, a: false, s: false, d: false };
+      let isLocked = false;
+
+      document.body.addEventListener('click', () => {
+	  if (!isLocked) document.body.requestPointerLock();
+      });
+
+      document.addEventListener('pointerlockchange', () => {
+	  isLocked = document.pointerLockElement === document.body;
+      });
+
+      document.addEventListener('keydown', (e) => {
+	  if (keys.hasOwnProperty(e.key.toLowerCase())) keys[e.key.toLowerCase()] = true;
+      });
+
+      document.addEventListener('keyup', (e) => {
+	  if (keys.hasOwnProperty(e.key.toLowerCase())) keys[e.key.toLowerCase()] = false;
+      });
+
+      document.addEventListener('mousemove', (e) => {
+	  if (isLocked) {
+	      const movementX = e.movementX || 0;
+	      const movementY = e.movementY || 0;
+
+	      camera.yaw -= movementX * 0.002;
+	      camera.pitch -= movementY * 0.002;
+
+	      // Clamp looking up and down
+	      camera.pitch = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, camera.pitch));
+	  }
+      });
+
+      document.addEventListener('wheel', (e) => {
+	  // Zoom by moving the camera forward/backward along its local Z axis
+	  const { forward } = cameraBasis();
+	  const d = e.deltaY * 0.05;
+	  camera.pos[0] -= forward[0] * d;
+	  camera.pos[1] -= forward[1] * d;
+	  camera.pos[2] -= forward[2] * d;
+      });
+
+      // 6. Animation Loop
+      let lastTime = performance.now();
+      const speed = 50;
+      const startTime = performance.now();
+
+      function draw() {
+        resizeCanvasToDisplaySize();
+        const now = performance.now();
+        const delta = Math.min(0.1, (now - lastTime) / 1000);
+        lastTime = now;
+        const elapsed = (now - startTime) / 1000;
+
+        const { forward, right } = cameraBasis();
+        const move = (dir, amount) => {
+          camera.pos[0] += dir[0] * amount;
+          camera.pos[1] += dir[1] * amount;
+          camera.pos[2] += dir[2] * amount;
+        };
+        if (keys.w) move(forward, speed * delta);
+        if (keys.s) move(forward, -speed * delta);
+        if (keys.a) move(right, -speed * delta);
+        if (keys.d) move(right, speed * delta);
+
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+        const aspect = canvas.width / Math.max(1, canvas.height);
+        const proj = mat4Perspective(75 * Math.PI / 180, aspect, 0.1, 3000);
+        const view = viewMatrix();
+        const viewProj = mat4Multiply(proj, view);
+
+        if (terrainMeshGL) {
+          gl.useProgram(terrainProgram);
+          gl.uniformMatrix4fv(terrainLoc.uViewProj, false, viewProj);
+          gl.uniform1f(terrainLoc.uUseTextures, useTexturesFlag ? 1.0 : 0.0);
+          gl.uniform1f(terrainLoc.uTexScale, 12.0); // world units per texture tile - reasonable default, not Ghidra-derived
+          gl.uniform3f(terrainLoc.uLightDir, 0.4, -0.8, 0.3);
+          gl.uniform3f(terrainLoc.uLightColor, 1.0, 0.98, 0.9);
+          gl.uniform3f(terrainLoc.uAmbientColor, 0.45, 0.45, 0.5);
+
+          for (let slot = 0; slot < 8; slot++) {
+            const layerIdx = activeLayerIndices[slot];
+            const tex = layerIdx !== undefined ? groundTextures[layerIdx] : FLAT_FALLBACK_TEX;
+            gl.activeTexture(gl.TEXTURE0 + slot);
+            gl.bindTexture(gl.TEXTURE_2D, tex);
+            gl.uniform1i(terrainLoc.uTex[slot], slot);
+          }
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, terrainMeshGL.posBuf);
+          gl.enableVertexAttribArray(terrainLoc.aPosition);
+          gl.vertexAttribPointer(terrainLoc.aPosition, 3, gl.FLOAT, false, 0, 0);
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, terrainMeshGL.normBuf);
+          gl.enableVertexAttribArray(terrainLoc.aNormal);
+          gl.vertexAttribPointer(terrainLoc.aNormal, 3, gl.FLOAT, false, 0, 0);
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, terrainMeshGL.shadowBuf);
+          gl.enableVertexAttribArray(terrainLoc.aShadow);
+          gl.vertexAttribPointer(terrainLoc.aShadow, 1, gl.FLOAT, false, 0, 0);
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, terrainMeshGL.w0Buf);
+          gl.enableVertexAttribArray(terrainLoc.aWeights0);
+          gl.vertexAttribPointer(terrainLoc.aWeights0, 4, gl.FLOAT, false, 0, 0);
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, terrainMeshGL.w1Buf);
+          gl.enableVertexAttribArray(terrainLoc.aWeights1);
+          gl.vertexAttribPointer(terrainLoc.aWeights1, 4, gl.FLOAT, false, 0, 0);
+
+          // Indexed/shared-vertex draw: weights are now SMOOTH per-vertex values (see
+          // compositeVertexChannels), so sharing vertices across faces is correct and
+          // gives GLSL-interpolated smooth blending instead of hard per-face edges.
+          gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, terrainMeshGL.idxBuf);
+          gl.drawElements(gl.TRIANGLES, terrainMeshGL.idxCount, gl.UNSIGNED_SHORT, 0);
+        }
+
+        if (entityMeshGroups.length && showEntitiesFlag) {
+          gl.useProgram(entityProgram);
+          gl.uniformMatrix4fv(entityLoc.uViewProj, false, viewProj);
+          gl.uniform3f(entityLoc.uLightDir, 0.4, -0.8, 0.3);
+          gl.uniform3f(entityLoc.uLightColor, 1.0, 0.98, 0.9);
+          gl.uniform3f(entityLoc.uAmbientColor, 0.45, 0.45, 0.5);
+          for (const group of entityMeshGroups) {
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, group.tex);
+            gl.uniform1i(entityLoc.uTex, 0);
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, group.posBuf);
+            gl.enableVertexAttribArray(entityLoc.aPosition);
+            gl.vertexAttribPointer(entityLoc.aPosition, 3, gl.FLOAT, false, 0, 0);
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, group.normBuf);
+            gl.enableVertexAttribArray(entityLoc.aNormal);
+            gl.vertexAttribPointer(entityLoc.aNormal, 3, gl.FLOAT, false, 0, 0);
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, group.uvBuf);
+            gl.enableVertexAttribArray(entityLoc.aUV);
+            gl.vertexAttribPointer(entityLoc.aUV, 2, gl.FLOAT, false, 0, 0);
+
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, group.idxBuf);
+            gl.drawElements(gl.TRIANGLES, group.idxCount, group.idxType, 0);
+          }
+        }
+
+        if (waterMeshGL) {
+          gl.useProgram(waterProgram);
+          gl.uniformMatrix4fv(waterLoc.uViewProj, false, viewProj);
+          gl.uniform1f(waterLoc.uTime, elapsed);
+          gl.uniform3f(waterLoc.uCameraPos, camera.pos[0], camera.pos[1], camera.pos[2]);
+          gl.uniform3f(waterLoc.uShallowColor, 0.35, 0.62, 0.63);
+          gl.uniform3f(waterLoc.uDeepColor, 0.05, 0.18, 0.32);
+          gl.uniform3f(waterLoc.uSkyColor, 0x87 / 255, 0xCE / 255, 0xEB / 255);
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, waterMeshGL.posBuf);
+          gl.enableVertexAttribArray(waterLoc.aPosition);
+          gl.vertexAttribPointer(waterLoc.aPosition, 3, gl.FLOAT, false, 0, 0);
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, waterMeshGL.depthBuf);
+          gl.enableVertexAttribArray(waterLoc.aDepth);
+          gl.vertexAttribPointer(waterLoc.aDepth, 1, gl.FLOAT, false, 0, 0);
+
+          gl.enable(gl.BLEND);
+          gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+          gl.depthMask(false);
+          gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, waterMeshGL.idxBuf);
+          gl.drawElements(gl.TRIANGLES, waterMeshGL.idxCount, gl.UNSIGNED_SHORT, 0);
+          gl.depthMask(true);
+          gl.disable(gl.BLEND);
+        }
+
+        requestAnimationFrame(draw);
+      }
+      requestAnimationFrame(draw);
+      window.__debugDraw = draw;
+      window.__debugSco = () => globalScoData;
+      window.__debugTerrainCode = () => currentTerrainCode;
+      window.__debugSetCamera = (x, y, z, yaw, pitch) => { camera.pos = [x, y, z]; camera.yaw = yaw; camera.pitch = pitch; };
+      window.__debugEntityGroups = () => entityMeshGroups.map(g => ({ idxCount: g.idxCount }));
+      window.__debugActiveLayers = () => activeLayerIndices.slice();
+    </script>
+  </body>
+</html>

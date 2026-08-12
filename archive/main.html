@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <title>M&B SCO Heightmap Visualizer</title>
+    <style>
+      body { margin: 0; overflow: hidden; background-color: #000; color: white; font-family: sans-serif; }
+      #ui { position: absolute; top: 10px; left: 10px; z-index: 100; background: rgba(0,0,0,0.7); padding: 15px; border-radius: 8px; }
+      canvas { display: block; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  </head>
+  <body>
+    <div id="ui">
+      <h3>.SCO Heightmap Viewer</h3>
+      <label>Load .sco file:</label><br>
+      <input type="file" id="scoInput" accept=".sco"><br><br>
+
+      <label>Load scenes.txt (Optional):</label><br>
+      <input type="file" id="txtInput" accept=".txt"><br><br>
+      <p>Controls: W, A, S, D to move. Scroll to zoom. Click canvas to rotate camera (Pointer Lock).</p>
+    </div>
+
+    <script>
+      // 1. Scene Setup
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x87CEEB); // Sky blue
+      
+      const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+      camera.position.set(0, 50, 100);
+      camera.rotation.order = 'YXZ';
+      camera.lookAt(0, 0, 0);
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      document.body.appendChild(renderer.domElement);
+
+      // Lighting
+      const light = new THREE.DirectionalLight(0xffffff, 1.0);
+      light.position.set(100, 200, 50);
+      scene.add(light);
+      scene.add(new THREE.AmbientLight(0x404040));
+
+      // 2. Base Heightmap Mesh
+      // M&B terrains are usually built on grid sizes based on the terrain code (e.g., 200x200)
+      const size = 200; 
+      const segments = 100; // Resolution of the terrain
+      const geometry = new THREE.PlaneGeometry(size, size, segments, segments);
+      geometry.rotateX(-Math.PI / 2); // Make it lay flat
+      
+      const material = new THREE.MeshLambertMaterial({ color: 0x228B22, wireframe: false });
+      let terrainMesh = new THREE.Mesh(geometry, material);
+      scene.add(terrainMesh);
+
+      // 3. Parser Logic (Translating swy-sco-tools logic)
+      class BinaryReader {
+          constructor(arrayBuffer) {
+              this.dataView = new DataView(arrayBuffer);
+              this.offset = 0;
+              this.littleEndian = true; // M&B files use Little-Endian
+          }
+
+          readUint32() {
+              const val = this.dataView.getUint32(this.offset, this.littleEndian);
+              this.offset += 4;
+              return val;
+          }
+
+          readInt32() {
+              const val = this.dataView.getInt32(this.offset, this.littleEndian);
+              this.offset += 4;
+              return val;
+          }
+
+          readFloat32() {
+              const val = this.dataView.getFloat32(this.offset, this.littleEndian);
+              this.offset += 4;
+              return val;
+          }
+          
+          readUint8() {
+              const val = this.dataView.getUint8(this.offset);
+              this.offset += 1;
+              return val;
+          }
+
+          readString(length) {
+              let str = '';
+              for (let i = 0; i < length; i++) {
+                  const charCode = this.dataView.getUint8(this.offset++);
+                  str += String.fromCharCode(charCode);
+              }
+              return str;
+          }
+
+          readRglTag() {
+              const size = this.readUint32();
+              if (size === 0) return '';
+              return this.readString(size);
+          }
+      }
+
+      function parseSCO(arrayBuffer) {
+	  const reader = new BinaryReader(arrayBuffer);
+	  
+	  try {
+	      // --- Header ---
+	      const magic = reader.readUint32();
+	      if (magic !== 0xFFFFFD33) {
+		  console.error("Invalid SCO magic number.");
+		  return null;
+	      }
+	      const version = reader.readUint32();
+	      if (version !== 4) {
+		  console.error("Invalid SCO version.");
+		  return null;
+	      }
+
+	      // --- Mission Objects ---
+	      const objectCount = reader.readUint32();
+	      for (let i = 0; i < objectCount; i++) {
+		  reader.offset += 12;      // type (4), id (4), garbage (4)
+		  reader.offset += 36;  // mtx_a, mtx_b, mtx_c (9x floats = 36 bytes)
+		  reader.offset += 12;      // pos (3x floats = 12 bytes)
+		  reader.readRglTag();      // str
+		  reader.offset += 8;       // entry_no (4), menu_item_no (4)
+		  reader.offset += 12;      // scale (3x floats = 12 bytes)
+	      }
+
+	      // --- AI Mesh ---
+	      const aiMeshSectionSize = reader.readUint32();
+	      const vertexCount = reader.readUint32();
+	      reader.offset += vertexCount * 12; // 3 floats per vertex
+
+	      const edgeCount = reader.readUint32();
+	      reader.offset += edgeCount * 20;   // 5 ints per edge
+
+	      const faceCount = reader.readUint32();
+	      for (let i = 0; i < faceCount; i++) {
+		  const vtxAndEdgeCount = reader.readUint32();
+		  reader.offset += vtxAndEdgeCount * 4; // idx_vertices
+		  reader.offset += vtxAndEdgeCount * 4; // idx_edges
+		  const hasMore = reader.readUint32();
+		  if (hasMore) {
+		      reader.offset += 4; // ai_mesh_id
+		  }
+	      }
+
+	      // Check if we reached the end (interior scenes may lack terrain)
+	      if (reader.offset >= reader.dataView.byteLength) {
+		  console.warn("Terrain section not present (possibly an interior scene).");
+		  return null;
+	      }
+
+	      // --- Terrain Layer ---
+	      const terrainMagic = reader.readUint32();
+	      if (terrainMagic !== 0xFF4AD1A6) {
+		  console.error("Invalid Terrain magic number.");
+		  return null;
+	      }
+
+	      const terrainSectionSize = reader.readUint32();
+	      const numLayers = reader.readUint32();
+	      const sceneWidth = reader.readUint32();
+	      const sceneHeight = reader.readUint32();
+
+	      const blockCount = sceneWidth * sceneHeight;
+	      let finalHeights = new Float32Array(blockCount);
+
+	      for (let i = 0; i < numLayers; i++) {
+		  const index = reader.readInt32();
+		  const layerStr = reader.readRglTag();
+		  const enabled = reader.readUint32();
+
+		  if (enabled) {
+		      let remainingBlocks = blockCount;
+		      let currentOffset = 0;
+		      let layerData = new Float32Array(blockCount);
+
+		      while (remainingBlocks > 0) {
+                          const rle = reader.readUint32(); // Run-Length Encoding skipped blocks
+                          
+                          if (rle > 0) {
+			      currentOffset += rle;
+			      remainingBlocks -= rle;
+			  }
+
+			  if (remainingBlocks <= 0) break;
+
+                          const elemCount = reader.readUint32();
+                          remainingBlocks -= elemCount;
+
+                          for (let j = 0; j < elemCount; j++) {
+			      if (layerStr === 'ground_elevation') {
+				  layerData[currentOffset++] = reader.readFloat32();
+			      } else if (layerStr === 'ground_leveling') {
+				  reader.readUint32(); // uint32 vertex coloring, discard
+				  currentOffset++;
+			      } else {
+				  reader.readUint8();  // uint8 grayscale mask, discard
+				  currentOffset++;
+			      }
+			  }
+		      }
+
+		      if (layerStr === 'ground_elevation') {
+			  finalHeights = layerData;
+		      }
+		  }
+	      }
+
+	      // M&B terrains store rows mirrored right-to-left. We flip the X axis.
+	      const correctedHeights = new Float32Array(blockCount);
+	      for (let y = 0; y < sceneHeight; y++) {
+		  for (let x = 0; x < sceneWidth; x++) {
+		      const srcIdx = y * sceneWidth + x;
+		      const destIdx = y * sceneWidth + (sceneWidth - 1 - x); // Flip X
+		      correctedHeights[destIdx] = finalHeights[srcIdx];
+		  }
+	      }
+
+	      return {
+		  width: sceneWidth,
+		  height: sceneHeight,
+		  heights: correctedHeights
+	      };
+
+	  } catch (e) {
+	      console.error("Error parsing .sco file. End of file reached or invalid format.", e);
+	      return null;
+	  }
+      }
+
+      function generateTerrain(scoData) {
+	  if (!scoData) return;
+
+	  if (terrainMesh) {
+              scene.remove(terrainMesh);
+              terrainMesh.geometry.dispose();
+              terrainMesh.material.dispose();
+	  }
+
+	  const { width, height, heights } = scoData;
+
+	  // Default fallback scaling (2.0 meters per vertex spacing)
+	  let finalMeshWidth = width * 2.0;
+	  let finalMeshHeight = height * 2.0;
+
+	  // If scenes.txt contains our map entry, overwrite fallback values with exact proportions
+	  if (currentSceneName && sceneDataMap[currentSceneName]) {
+              const match = sceneDataMap[currentSceneName];
+              finalMeshWidth = match.width;
+              finalMeshHeight = match.height;
+              console.log(`Match found! Scaling mesh to exact scenes.txt bounds: ${finalMeshWidth}m x ${finalMeshHeight}m`);
+	  } else {
+              console.warn(`Scene "${currentSceneName}" not matched in scenes.txt data. Using 2.0x spacing default.`);
+	  }
+
+	  // Pass true physical sizing directly into Three.js PlaneGeometry layout
+	  const geometry = new THREE.PlaneGeometry(finalMeshWidth, finalMeshHeight, width - 1, height - 1);
+	  geometry.rotateX(-Math.PI / 2); 
+
+	  const vertices = geometry.attributes.position.array;
+	  
+	  for (let i = 0; i < heights.length; i++) {
+              vertices[i * 3 + 1] = heights[i]; 
+	  }
+
+	  geometry.computeVertexNormals(); 
+
+	  const material = new THREE.MeshStandardMaterial({ 
+              color: 0x55aa55, 
+              wireframe: true
+	  });
+
+	  terrainMesh = new THREE.Mesh(geometry, material);
+	  scene.add(terrainMesh);
+      }
+      
+      // 4. Read file
+      let sceneDataMap = {};     // Stores calculated width/height from scenes.txt
+      let currentSceneName = ""; // Stores current .sco filename (e.g., "scn_town_1")
+      let globalScoData = null;  // Caches loaded SCO data for real-time adjustments
+
+      // Listener to read and parse scenes.txt entries
+      document.getElementById('txtInput').addEventListener('change', function(event) {
+	  const file = event.target.files[0];
+	  if (!file) return;
+
+	  const reader = new FileReader();
+	  reader.onload = function(e) {
+	      const text = e.target.result;
+	      const lines = text.split('\n');
+	      
+	      sceneDataMap = {}; // Reset index map
+	      
+	      for (let line of lines) {
+		  line = line.trim();
+		  if (!line || line.startsWith('#')) continue;
+		  
+		  const tokens = line.split(/\s+/);
+		  if (tokens.length >= 7) {
+		      const sceneId = tokens[0].toLowerCase();
+		      const len = tokens.length;
+
+		      // Initalize empty
+		      sceneDataMap[sceneId] = {};
+		      
+		      const terrain_code_str = tokens[len - 1]; // e.g., "0x00000001300389800003a4ea000058340000637a"
+
+		      let gridSpacing = 2.0;
+		      // Ensure valid hex code
+		      if (terrain_code_str.startsWith("0x")) {
+			  // 1. Strip the "0x" and isolate the first 16 characters (the first 64-bit integer)
+			  const coreHex = terrain_code_str.replace("0x", "").substring(0, 16);
+			  
+			  // 2. Parse as BigInt for 64-bit bitwise operations
+			  const bitfield = BigInt("0x" + coreHex);
+
+			  /* 
+			   * 3. Extract Bitfields (Offsets derived from cmpxchg8b/Swyter logic)
+			   */
+			  const regionDetail = Number((bitfield >> 0n) & 0x3n);
+			  
+			  // 4. Map the index to actual meter spacing
+			  gridSpacing = regionDetail + 2.0;
+		      }
+		      
+		      // Mount & Blade format always ends with: min_x min_y max_x max_y water_level terrain_code
+		      // We parse backwards from the end token to avoid column shift errors
+		      const min_x = parseFloat(tokens[len - 6]);
+		      const min_y = parseFloat(tokens[len - 5]);
+		      const max_x = parseFloat(tokens[len - 4]);
+		      const max_y = parseFloat(tokens[len - 3]);
+
+		      if (!isNaN(min_x) && !isNaN(max_x) && !isNaN(min_y) && !isNaN(max_y)) {
+			  const realWidth = max_x - min_x;
+			  const realHeight = max_y - min_y;
+			  
+			  if (realWidth > 0 && realHeight > 0) {
+			      sceneDataMap[sceneId]["width"] = realWidth * gridSpacing;
+			      sceneDataMap[sceneId]["height"] = realHeight * gridSpacing;
+			  }
+		      }
+		  }
+
+	      }
+	      console.log("Parsed scenes.txt. Total scenes indexed:", Object.keys(sceneDataMap).length);
+	      
+	      // If an .sco file was already loaded, instantly update its scaling layout
+	      if (globalScoData) {
+		  generateTerrain(globalScoData);
+	      }
+	  };
+	  reader.readAsText(file);
+      });
+
+      document.getElementById('scoInput').addEventListener('change', function(event) {
+	  const file = event.target.files[0];
+	  if (!file) return;
+
+	  // Capture filename and strip extension to match scenes.txt ID keys
+	  currentSceneName = file.name.replace(/\.sco$/i, '').toLowerCase();
+
+	  const fileReader = new FileReader();
+	  
+	  fileReader.onload = function(e) {
+	      const arrayBuffer = e.target.result;
+	      console.log("File loaded, size:", arrayBuffer.byteLength, "bytes");
+	      
+	      const scoData = parseSCO(arrayBuffer);
+	      
+	      globalScoData = scoData; // Cache the data globally
+	      generateTerrain(scoData);
+	  };
+
+	  fileReader.readAsArrayBuffer(file);
+      });
+
+      // 5. Input & Movement (WASD + Mouse Rotation + Zoom)
+      const keys = { w: false, a: false, s: false, d: false };
+      let isLocked = false;
+
+      document.body.addEventListener('click', () => {
+	  if (!isLocked) document.body.requestPointerLock();
+      });
+
+      document.addEventListener('pointerlockchange', () => {
+	  isLocked = document.pointerLockElement === document.body;
+      });
+
+      document.addEventListener('keydown', (e) => {
+	  if (keys.hasOwnProperty(e.key.toLowerCase())) keys[e.key.toLowerCase()] = true;
+      });
+
+      document.addEventListener('keyup', (e) => {
+	  if (keys.hasOwnProperty(e.key.toLowerCase())) keys[e.key.toLowerCase()] = false;
+      });
+
+      document.addEventListener('mousemove', (e) => {
+	  if (isLocked) {
+	      const movementX = e.movementX || 0;
+	      const movementY = e.movementY || 0;
+	      
+	      camera.rotation.y -= movementX * 0.002;
+	      camera.rotation.x -= movementY * 0.002;
+	      
+	      // Clamp looking up and down
+	      camera.rotation.x = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, camera.rotation.x));
+	  }
+      });
+
+      document.addEventListener('wheel', (e) => {
+	  // Zoom by moving the camera forward/backward along its local Z axis
+	  camera.translateZ(e.deltaY * 0.05);
+      });
+
+      // 6. Animation Loop
+      const clock = new THREE.Clock();
+      const speed = 50;
+
+      function animate() {
+	  requestAnimationFrame(animate);
+
+	  const delta = clock.getDelta();
+	  
+	  // Camera movement relative to its rotation
+	  if (keys.w) camera.translateZ(-speed * delta);
+	  if (keys.s) camera.translateZ(speed * delta);
+	  if (keys.a) camera.translateX(-speed * delta);
+	  if (keys.d) camera.translateX(speed * delta);
+
+	  renderer.render(scene, camera);
+      }
+      animate();
+
+      // Handle Window Resize
+      window.addEventListener('resize', () => {
+	  camera.aspect = window.innerWidth / window.innerHeight;
+	  camera.updateProjectionMatrix();
+	  renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+    </script>
+  </body>
+</html>

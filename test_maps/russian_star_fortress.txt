@@ -1,0 +1,4 @@
+russian_star_fortress russian_star_fortress 256 none none 0.000000 0.000000 100.000000 100.000000 -100.000000 0x0000000340c14284000721bd0000767c000003d70000e5f0
+0
+0
+outer_terrain_snow 

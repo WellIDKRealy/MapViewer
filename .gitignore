@@ -1,0 +1,4 @@
+.debug_captures/
+.texture_cache/
+.texture_server.log
+.texture_server.err

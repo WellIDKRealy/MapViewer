@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Minimal generic static/raw-file server for main2.html (M&B Warband .sco/
+Minimal generic static/raw-file server for main.html (M&B Warband .sco/
 terrain-code viewer).
 
 This file intentionally contains ZERO Warband-specific interpretation - no
 .dds decoding, no .brf chunk parsing, no scene_props.txt/materials.brf
 resolution, no sokf_* flag knowledge. All of that now lives client-side in
-main2.html (see its DDS/BRF/scene-props JS modules), so this server is just:
-  1. Static files from its own directory (main2.html itself, loaded .sco/.txt
+main.html (see its DDS/BRF/scene-props JS modules), so this server is just:
+  1. Static files from its own directory (main.html itself, loaded .sco/.txt
      files the user picks, etc.) - via the stock SimpleHTTPRequestHandler.
   2. GET /list/<relpath>  -> JSON array of filenames directly inside
      WARBAND_ROOT/<relpath> (a plain os.listdir() - generic, works for any
@@ -20,7 +20,7 @@ main2.html (see its DDS/BRF/scene-props JS modules), so this server is just:
 Usage:
     python texture_server.py [port]        (default port 8791)
 
-Then open http://localhost:8791/main2.html in a browser.
+Then open http://localhost:8791/main.html in a browser.
 """
 import http.server
 import json
@@ -134,7 +134,7 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"[texture_server] serving {SCRIPT_DIR} (static) + {WARBAND_ROOT} (via /list, /raw) "
           f"on http://localhost:{port}/")
-    print(f"[texture_server] open http://localhost:{port}/main2.html")
+    print(f"[texture_server] open http://localhost:{port}/main.html")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

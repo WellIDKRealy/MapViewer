@@ -604,7 +604,7 @@
       // after this function in Terrain_Build's confirmed call order but are separate,
       // not-yet-ported functions (see the file-level comment block above and the STUBs
       // below).
-      function generateTerrainHeightmap(gridW, gridH, cellSize, hillHeight, vegetation) {
+      function generateTerrainHeightmap(gridW, gridH, cellSize, hillHeight, vegetation, valley) {
         // CORRECTED this pass: does NOT call setSeed() itself anymore. [Ghidra, fresh
         // disassembly: Terrain_Build] g_terrainRngState is seeded ONCE with seed0, and
         // Terrain_generateLayers (aPaintLayerSlots[0] coinflip + 2-3 more draws) runs BEFORE
@@ -615,6 +615,7 @@
         // shifted"). The caller (generateTerrain()) now does the seeding + generateLayers'
         // draws immediately before calling this function.
         hillHeight = (hillHeight === undefined) ? 30 : hillHeight; // terrain code's Hill Height field (0-127); default only used if no terrain code loaded
+        valley = (valley === undefined) ? 0 : valley; // terrain code's Valley field (0-127); drives Pass 1's heightFactor amplitude below, NOT hillHeight (Ghidra: Terrain_generateTerrain reads dwTerrainTypeFlags unshifted = bits[0:7) = Valley, not the hillHeight field at bits[7:14))
 
         const w = gridW + 1, h = gridH + 1;
         const terrainWorldSizeX = w * cellSize; // matches Terrain_Build's confirmed gridDim*cellSize relationship
@@ -643,11 +644,22 @@
         // by valley carving below - previously hardcoded to a constant 1.0 there, which
         // over-carved every valley to maximum depth everywhere instead of the real spatially-
         // varying [0.1, 1.0] factor.
+        // CORRECTED this pass: the amplitude multiplier is the terrain code's VALLEY field, not
+        // hillHeight. Fresh decompile of Terrain_generateTerrain (0x00508170) shows
+        // `fVar1 = this->dwTerrainTypeFlags & (DAT_0085f3e0-1)` - an UNSHIFTED read of the
+        // packed key-4 dword, i.e. bits[0:7), which parseTerrainCode's own confirmed layout
+        // (this file, bits(4,0,7)) identifies as `valley` - hillHeight is bits[7:14), a
+        // different field entirely (and IS the correct multiplier for hillFactor inside
+        // carveValleyAt below - that usage is unrelated and unchanged). Using hillHeight here
+        // produced a spatially-coherent but wrong-amplitude heightFactor field: since it
+        // modulates every later valley-bump delta, it explains why some map locations
+        // (wherever valley and hillHeight happened to be close) looked fine while others
+        // (wherever they diverge) showed entities buried tens of meters into terrain.
         for (let row = 0; row < h; row++) {
           for (let col = 0; col < w; col++) {
             const i = idx(col, row);
             const n = rglPerlinOctave(noiseFrequencyScale, 0.6, 1, 0, col * cellSize + noiseOffX, row * cellSize + noiseOffY, noiseOffZ);
-            let f = (n[0] + n[1] + n[2]) * (hillHeight / 100.0) * 9.0;
+            let f = (n[0] + n[1] + n[2]) * (valley / 100.0) * 9.0;
             f = Math.max(0.0, Math.min(1.0, f));
             heightFactor[i] = (Math.cos(f * Math.PI) + 1.0) * 0.45 + 0.1;
           }
@@ -714,6 +726,8 @@
         const ringDivisor = Math.pow((100 - vegClamped) * 0.045, 2) * 4.0;
         const bandRadius = Math.max(2.0, ringCountBaseSize / ringDivisor);
         const ringCount = Math.round(Math.log(bandRadius) * 1.4426950408889634);
+        window.__debugValleyRings = [];
+        window.__debugValleySummary = { ringCountBaseSize, vegClamped, ringDivisor, bandRadius, ringCount, terrainWorldSizeX, terrainWorldSizeY };
         let strengthWeight = 1.0;
         for (let ring = 0; ring <= ringCount; ring++) {
           const spacing = TERRAIN_CONST.VALLEY_RING_SPACING_POW2[Math.min(ring, TERRAIN_CONST.VALLEY_RING_SPACING_POW2.length - 1)];
@@ -749,6 +763,7 @@
         const densityWeight = rand01() * 0.2 + 0.4;
         const areaFactor = (worldSizeX * densityScale * worldSizeY) / (0.25 * radiusScale * radiusScale);
         const valleyCount = Math.round(Math.round(areaFactor) * densityWeight * 30.0);
+        if (window.__debugValleyRings) window.__debugValleyRings.push({ radiusScale, densityScale, strengthWeight, areaFactor, valleyCount });
         const boundsMargin = radiusScale * 2;
         for (let v = 0; v < valleyCount; v++) {
           const radius = radiusScale * (randomBell4Sum() * 0.5 + 0.05);
@@ -1399,6 +1414,7 @@
 	      const blockCount = sceneWidth * sceneHeight;
 	      let finalHeights = new Float32Array(blockCount); // zero-init matches confirmed "empty run" default fill
 	      let elevationFound = false;
+	      const levelingDebug = new Uint32Array(blockCount).fill(0xffffffff); // DEBUG: capture leveling layer instead of discarding, to test correlation with the floating-village bug
 	      const rawLayerWeights = {}; // layerIndex (0-10) -> Uint8Array(blockCount), raw /255 paint weight
 
 	      for (let i = 0; i < numLayers; i++) {
@@ -1442,7 +1458,7 @@
 			      if (isElevation) {
 				  layerData[cellIndex] = reader.readFloat32();
 			      } else {
-				  reader.readUint32(); // leveling ARGB color - discarded, doesn't affect geometry
+				  levelingDebug[cellIndex] = reader.readUint32(); // DEBUG: capture instead of discard
 			      }
 			  } else {
 			      // [confirmed: single byte (vtable+0x50) for generic ground-spec layers 0-10,
@@ -1484,6 +1500,7 @@
 		  heights: finalHeights,
 		  layerWeights: rawLayerWeights, // { [0-10]: Uint8Array(blockCount) } - only keys that were actually present
 		  entities,
+		  levelingDebug,
 	      };
 
 	  } catch (e) {
@@ -1792,29 +1809,40 @@
 	  disposeMesh(waterMeshGL); waterMeshGL = null;
 	  disposeEntityMeshes();
 
-	  // scoData.width/height are the FILE's stored grid dims, which equal
-	  // gridWidthMinusOne+1 / gridHeightMinusOne+1 in the engine's own terms
-	  // [Ghidra: Terrain_LoadGroundPaintData confirmed this + Terrain_ApplyPaintLayerEntry's
-	  //  loop bounds independently corroborate the +1 relationship].
-	  const { width, height, heights: elevationDelta } = scoData;
-	  const gridW = width - 1;  // == terrain->gridWidthMinusOne
-	  const gridH = height - 1; // == terrain->gridHeightMinusOne
+	  // GRID DIMENSIONS: Ghidra-confirmed (Terrain_Build @ 0x00510ee0) that the engine's
+	  // actual vertex grid (dwGridWidthMinusOne/dwGridHeightMinusOne, world size = (dim+1)*cellSize)
+	  // is ALWAYS sized from the terrain code's packed grid-size field (numFacesX/numFacesY,
+	  // clamped [40,250]) - NEVER from the .sco file's own stored width/height. The .sco's
+	  // width/height only bound how much of its paint canvas (elevation deltas + layer masks)
+	  // was actually written; Terrain_ApplyPaintLayerEntry (0x00501470) walks that canvas using
+	  // the TERRAIN's own (terrain-code-derived) dwGridWidthMinusOne/dwGridHeightMinusOne loop
+	  // bounds against a fixed-stride-420 buffer, so when the .sco's canvas is LARGER than the
+	  // terrain-code grid, only the top-left corner of it is ever read (a crop, not a resample);
+	  // when the .sco's canvas is SMALLER, the excess terrain-code-grid cells simply get the
+	  // buffer's default (0.0) - confirmed via Terrain_LoadGroundPaintData's zero-init pattern.
+	  // Previously this file used the .sco's OWN width/height for the render grid, which for
+	  // maps where the two disagree (e.g. euc_Arcole: terrain code 89x91, .sco canvas 204x204)
+	  // produced a wrong world size/shape entirely - not merely missing some paint data.
+	  const gridW = currentTerrainCode.numFacesX;  // == terrain->dwGridWidthMinusOne
+	  const gridH = currentTerrainCode.numFacesY;  // == terrain->dwGridHeightMinusOne
+	  const width = gridW + 1, height = gridH + 1;
+	  const scoW = scoData.width, scoH = scoData.height;
+	  const elevationDelta = scoData.heights;
+	  // Sample a .sco-canvas-resolution array (stride scoW) at a terrain-grid (col,row)
+	  // coordinate, returning 0 outside the .sco's own painted extent - this is the exact
+	  // crop/pad behavior Terrain_ApplyPaintLayerEntry's loop bounds produce.
+	  const sampleSco = (arr, col, row) => (arr && row < scoH && col < scoW) ? arr[row * scoW + col] : 0;
 
 	  // EXACT: cellSize = regionDetail + 2, decoded directly from the terrain code
 	  // (parseTerrainCode above), per terrain(1).md and cross-checked against
 	  // Swyter/mab-tools' independent terrain-code generator, and this session's own
 	  // direct Ghidra re-derivation (see parseTerrainCode's comment).
 	  const cellSize = currentTerrainCode.cellSize;
-	  if (currentTerrainCode.numFacesX !== gridW || currentTerrainCode.numFacesY !== gridH) {
-              // NOT a refusal: cross-checked against the real shipped scenes.txt (Server/Dedicated),
-              // this mismatch is GENUINE for some real maps (e.g. scn_mp_fort_george and scn_mp_naval
-              // both ship a terrain code implying a different grid than their own .sco's actual grid -
-              // confirmed authentic, not a bad pairing) - the .sco's own grid dims are authoritative
-              // regardless. Only cellSize/seed/region/hillHeight come from the terrain code.
-              console.warn(`Terrain code implies a ${currentTerrainCode.numFacesX}x${currentTerrainCode.numFacesY}-face grid but the loaded .sco has ${gridW}x${gridH} faces - they may be from different scenes. Using cellSize=${cellSize}m from the terrain code and the .sco's own grid dimensions/heights regardless.`);
+	  if (scoW !== width || scoH !== height) {
+              console.warn(`Terrain code implies a ${gridW}x${gridH}-face grid but the loaded .sco's own paint canvas is ${scoW - 1}x${scoH - 1} faces - per Terrain_ApplyPaintLayerEntry, the engine renders at the terrain-code's ${gridW}x${gridH} size and crops/pads the .sco's paint data to fit (not the other way around).`);
 	  }
 
-	  const vIndex = (col, row) => row * width + col; // matches parseSCO's row-major heights[] layout
+	  const vIndex = (col, row) => row * width + col; // matches the render grid's own row-major layout (terrain-code sized, may differ from the .sco's own stride - see sampleSco)
 
 	  // === EXACT procedural HEIGHT pipeline, re-verified via fresh full-disassembly this pass
 	  // (not decompiler paraphrase - see the project's plan/COMPLETED_WORK.md for the specific
@@ -1837,7 +1865,7 @@
 	  if (currentTerrainCode.regionType === 2) lcgNext();             // draw3: steppe-only (Terrain_generateLayers) - likewise must be drawn to stay in sync
 	  const regionSlots = getRegionMaterialSlots(currentTerrainCode.regionType);
 
-	  const proceduralBase = generateTerrainHeightmap(gridW, gridH, cellSize, currentTerrainCode.hillHeight, currentTerrainCode.vegetation); // continues the SAME stream, does not reseed
+	  const proceduralBase = generateTerrainHeightmap(gridW, gridH, cellSize, currentTerrainCode.hillHeight, currentTerrainCode.vegetation, currentTerrainCode.valley); // continues the SAME stream, does not reseed
 
 	  setSeed(currentTerrainCode.seed1); // [Ghidra: Terrain_Build] reseed to rngSeedSourceB before generateRiver
 	  lcgNext(); // Terrain_generateRiver's one unconditional draw (confirmed via fresh disassembly: burned even on the immediate-reject no-river path) - full river carving stays out of scope, but this draw must happen to keep smoothHeight's per-vertex jitter in sync
@@ -1878,7 +1906,12 @@
 	  // saved elevation delta on top, exactly matching Terrain_ApplyPaintLayerEntry's confirmed
 	  // `z = heightBackup + paintedElevationDelta`.
 	  const heights = new Float32Array(width * height);
-	  for (let i = 0; i < heights.length; i++) heights[i] = roughenedHeights[i] + elevationDelta[i];
+	  for (let row = 0; row < height; row++) {
+              for (let col = 0; col < width; col++) {
+		  const i = vIndex(col, row);
+		  heights[i] = roughenedHeights[i] + sampleSco(elevationDelta, col, row);
+              }
+	  }
 	  window.__debugHeights = { proceduralBase: proceduralBase.heights, smoothedHeights, roughenedHeights, elevationDelta, combined: heights };
 
 	  if (scoData.entities && scoData.entities.length) {
@@ -1928,7 +1961,7 @@
 		  vertexChannels[base + 3] = waterMarker;
 		  for (let p = 0; p < 11; p++) {
 		      const arr = scoData.layerWeights ? scoData.layerWeights[p] : null;
-		      vertexChannels[base + 4 + p] = arr ? arr[i] / 255 : 0.0;
+		      vertexChannels[base + 4 + p] = arr ? sampleSco(arr, col, row) / 255 : 0.0;
 		  }
               }
 	  }

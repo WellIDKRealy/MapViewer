@@ -69,7 +69,11 @@
       // computation) so the file has zero external dependencies and runs fully offline.
       // ==========================================================================
       const canvas = document.getElementById('glcanvas');
-      const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+      // preserveDrawingBuffer: true - without this, the drawing buffer clears after each
+      // composite, so any readPixels()/toBlob() call from outside the rAF draw() callback
+      // (e.g. programmatic verification) reads a blank/cleared buffer, not the last frame.
+      const glContextOptions = { preserveDrawingBuffer: true };
+      const gl = canvas.getContext('webgl', glContextOptions) || canvas.getContext('experimental-webgl', glContextOptions);
       if (!gl) {
         document.body.innerHTML = '<p style="color:#f88;padding:20px;font-family:sans-serif;">WebGL1 is not available in this browser.</p>';
         throw new Error('WebGL1 unavailable');
@@ -618,8 +622,13 @@
         valley = (valley === undefined) ? 0 : valley; // terrain code's Valley field (0-127); drives Pass 1's heightFactor amplitude below, NOT hillHeight (Ghidra: Terrain_generateTerrain reads dwTerrainTypeFlags unshifted = bits[0:7) = Valley, not the hillHeight field at bits[7:14))
 
         const w = gridW + 1, h = gridH + 1;
-        const terrainWorldSizeX = w * cellSize; // matches Terrain_Build's confirmed gridDim*cellSize relationship
-        const terrainWorldSizeY = h * cellSize;
+        // BUG FIX (live TraceRmi debugging, 2026-08-17): was `w * cellSize` (gridW+1) - Terrain_Build's
+        // fresh decompile confirms `this->flTerrainWorldSizeX = (float)(int)this->dwGridWidthMinusOne *
+        // this->flCellSize` (NO +1). Caught via a direct live-vs-JS numeric comparison on scn_euc_Arcole:
+        // live flNoiseFrequencyScale=442.86 vs this file's old 445.03 (ratio 0.99512 = exactly 1020/1025,
+        // i.e. 204/205) - confirms gridW*cellSize (204*5=1020), not (gridW+1)*cellSize (205*5=1025).
+        const terrainWorldSizeX = gridW * cellSize;
+        const terrainWorldSizeY = gridH * cellSize;
 
         // LITERAL re-port from Terrain_generateTerrain's raw decompile (0x00508170, re-fetched
         // and re-verified this pass - a previous port here had drifted from the real draw
@@ -723,9 +732,30 @@
         // (spacing[ring]=2^ring, VALLEY_RING_SPACING_POW2 above), densityScale=1.0 except on
         // the LAST ring where it's (bandRadius-spacing[ringCount])/spacing[ringCount].
         const vegClamped = Math.max(0, Math.min(99, vegetation));
-        const ringDivisor = Math.pow((100 - vegClamped) * 0.045, 2) * 4.0;
+        // BUG FIX (live TraceRmi debugging, 2026-08-17): was Math.pow((100-vegClamped)*0.045, 2) -
+        // i.e. base^2. The decompiled call `CRT_pow((100-uVar6)*0.045, 2.0)` reads left-to-right as
+        // (base, exponent) in naive C pow(x,y)=x^y convention, but CRT_pow's OWN Ghidra-confirmed
+        // signature (from an earlier session, independent of this fix) is
+        // `float10 CRT_pow(float10 exp, float10 base)` - REVERSED: first positional arg is the
+        // EXPONENT, second is the BASE. So this call is actually pow(base=2.0, exp=(100-veg)*0.045) =
+        // 2.0^((100-veg)*0.045), not ((100-veg)*0.045)^2.0. Confirmed two independent ways: (1) the
+        // pre-existing CRT_pow signature above, and (2) live memory on scn_euc_Arcole (vegetation=1):
+        // live bandRadius=13.684386 implies ringDivisor=87.7301, matching 2.0**((100-1)*0.045)*4=
+        // 87.7301 to 5+ significant figures, not the old formula's 79.388. Lesson: when a decompiled
+        // call site uses a CRT_* thunk with x87-implicit-stack args, check the callee's OWN confirmed
+        // parameter names/order before assuming standard math-library argument convention from the
+        // pseudocode's left-to-right positions - the decompiler only reports push order, not semantic
+        // role.
+        const ringDivisor = Math.pow(2.0, (100 - vegClamped) * 0.045) * 4.0;
         const bandRadius = Math.max(2.0, ringCountBaseSize / ringDivisor);
-        const ringCount = Math.round(Math.log(bandRadius) * 1.4426950408889634);
+        // BUG FIX (live TraceRmi debugging, 2026-08-17): was Math.round(...). Ghidra:
+        // Math_RoundFloatToInt64 (0x00624870) - despite its name - TRUNCATES on its SSE2 fast path
+        // (`return (int64)(int)x`, confirmed via decompile; the "genuine round" comment on that
+        // function describes only the near-never-taken non-SSE2 fallback). Confirmed live: for
+        // scn_euc_Arcole's first valley ring, 3*0.599026*30=53.912 produced EAX=53 (truncated), not
+        // 54 (rounded) - read directly from the live process. Every Math_RoundFloatToInt64 call site
+        // in this pipeline needs Math.trunc, not Math.round.
+        const ringCount = Math.trunc(Math.log(bandRadius) * 1.4426950408889634);
         window.__debugValleyRings = [];
         window.__debugValleySummary = { ringCountBaseSize, vegClamped, ringDivisor, bandRadius, ringCount, terrainWorldSizeX, terrainWorldSizeY };
         let strengthWeight = 1.0;
@@ -762,7 +792,16 @@
       function applyValleyRing(heights, heightFactor, w, h, cellSize, worldSizeX, worldSizeY, radiusScale, densityScale, strengthWeight, hillHeight) {
         const densityWeight = rand01() * 0.2 + 0.4;
         const areaFactor = (worldSizeX * densityScale * worldSizeY) / (0.25 * radiusScale * radiusScale);
-        const valleyCount = Math.round(Math.round(areaFactor) * densityWeight * 30.0);
+        // BUG FIX (live TraceRmi debugging, 2026-08-17): outer round was Math.round(...), now
+        // Math.trunc(...) - Ghidra's Math_RoundFloatToInt64 (0x00624870) truncates on its SSE2 fast
+        // path despite its name (see generateTerrainHeightmap's ringCount fix above for the full
+        // finding). The INNER Math.round(areaFactor) is a DIFFERENT code path (a hand-rolled
+        // floor+conditional-increment round-half-up sequence in Terrain_ApplyValley, not a call to
+        // Math_RoundFloatToInt64) and stays Math.round. Confirmed live on scn_euc_Arcole ring 0:
+        // round(areaFactor)=3, densityWeight=0.599026, 3*0.599026*30=53.912 -> live valleyCount=53
+        // (truncated), not 54 (rounded) - read directly from EAX at the live process's own
+        // Terrain_ApplyValley call (0x005074ff, right after its Math_RoundFloatToInt64 call).
+        const valleyCount = Math.trunc(Math.round(areaFactor) * densityWeight * 30.0);
         if (window.__debugValleyRings) window.__debugValleyRings.push({ radiusScale, densityScale, strengthWeight, areaFactor, valleyCount });
         const boundsMargin = radiusScale * 2;
         for (let v = 0; v < valleyCount; v++) {
@@ -814,7 +853,17 @@
       // here as simply returning the new height array, since this project's `heights` array
       // already serves as both (see generateTerrain()'s own heightBackup-tracking comment).
       function smoothHeightPass(heights, width, height) {
-        const out = new Float32Array(heights);
+        // BUG FIX (live TraceRmi debugging, 2026-08-17): was double-buffered (Jacobi-style: read
+        // ALL neighbors from a frozen pre-pass snapshot, write to a separate output array). Fresh
+        // disassembly of Terrain_smoothHeight (0x005004a0) shows the real engine smooths IN PLACE,
+        // directly mutating aVertexGrid[...].z/heightBackup as it iterates row-outer/col-inner -
+        // so by the time vertex (row,col) is processed, its N/NW/NE/W neighbors (already visited
+        // earlier in the SAME pass, since they have smaller row, or equal row and smaller col) have
+        // ALREADY been smoothed, while its S/SE/SW/E neighbors (not yet visited) still hold their
+        // original pre-pass heights. This is Gauss-Seidel-style relaxation, not Jacobi - a real
+        // algorithmic difference, not just a formula/constant typo, and it compounds across
+        // thousands of vertices. Fixed by mutating `heights` directly (no separate `out` buffer),
+        // in the same row-outer/col-inner order the engine uses.
         for (let row = 0; row < height; row++) {
           for (let col = 0; col < width; col++) {
             let sum = 0, count = 0;
@@ -832,10 +881,10 @@
             let delta = avg - heights[i];
             delta = Math.max(-10.0, Math.min(2.0, delta));
             const jitterScale = rand01() * 0.4 + 0.2; // one LCG draw per vertex, unconditional
-            out[i] = heights[i] + delta * jitterScale;
+            heights[i] = heights[i] + delta * jitterScale;
           }
         }
-        return out;
+        return heights;
       }
 
       // [Ghidra: Terrain_roughenRockVertices @ 0x00501020, fresh disassembly this pass]
@@ -1579,6 +1628,33 @@
         return indices;
       }
 
+      // [Ghidra: Terrain_BuildRiverRenderMesh @ 0x0056ba20, live TraceRmi debugging session
+      // 2026-08-17] Selects only the faces that actually touch water, matching the real engine's
+      // gate exactly: `if (aVertexGrid[cornerA].z <= -0.3 || cornerB.z <= -0.3 || cornerC.z <= -0.3)`
+      // - a face gets water geometry the moment ANY of its 3 corners dips to or below -0.3, not
+      // just fully-submerged faces. Same TL/TR/BL/BR triangulation/winding as buildIndices, just
+      // filtered to the subset of faces meeting this gate.
+      function buildWaterIndices(gridW, gridH, width, heights) {
+        const vIndex = (col, row) => row * width + col;
+        const indices = [];
+        for (let faceRow = 0; faceRow < gridH; faceRow++) {
+          for (let faceCol = 0; faceCol < gridW; faceCol++) {
+            const TL = vIndex(faceCol, faceRow);
+            const TR = vIndex(faceCol + 1, faceRow);
+            const BL = vIndex(faceCol, faceRow + 1);
+            const BR = vIndex(faceCol + 1, faceRow + 1);
+            if (heights[TL] > -0.3 && heights[TR] > -0.3 && heights[BL] > -0.3 && heights[BR] > -0.3) continue;
+            const flip = (faceCol + faceRow) & 1;
+            if (flip === 0) {
+              indices.push(TR, BL, TL, TR, BR, BL);
+            } else {
+              indices.push(TL, TR, BR, TL, BR, BL);
+            }
+          }
+        }
+        return new Uint16Array(indices);
+      }
+
       // -------------------- GPU mesh state --------------------
       let terrainMeshGL = null; // { posBuf, normBuf, w0Buf, w1Buf, idxBuf, idxCount }
       let waterMeshGL = null;   // { posBuf, depthBuf, idxBuf, idxCount } or null
@@ -1866,6 +1942,7 @@
 	  const regionSlots = getRegionMaterialSlots(currentTerrainCode.regionType);
 
 	  const proceduralBase = generateTerrainHeightmap(gridW, gridH, cellSize, currentTerrainCode.hillHeight, currentTerrainCode.vegetation, currentTerrainCode.valley); // continues the SAME stream, does not reseed
+	  const proceduralBaseSnapshot = proceduralBase.heights.slice(); // smoothHeightPass now mutates in-place (see its own comment) - keep a pre-smooth copy purely for the __debugHeights inspection below
 
 	  setSeed(currentTerrainCode.seed1); // [Ghidra: Terrain_Build] reseed to rngSeedSourceB before generateRiver
 	  lcgNext(); // Terrain_generateRiver's one unconditional draw (confirmed via fresh disassembly: burned even on the immediate-reject no-river path) - full river carving stays out of scope, but this draw must happen to keep smoothHeight's per-vertex jitter in sync
@@ -1912,7 +1989,7 @@
 		  heights[i] = roughenedHeights[i] + sampleSco(elevationDelta, col, row);
               }
 	  }
-	  window.__debugHeights = { proceduralBase: proceduralBase.heights, smoothedHeights, roughenedHeights, elevationDelta, combined: heights };
+	  window.__debugHeights = { proceduralBase: proceduralBaseSnapshot, smoothedHeights, roughenedHeights, elevationDelta, combined: heights };
 
 	  if (scoData.entities && scoData.entities.length) {
               buildEntityMeshes(scoData.entities);
@@ -2030,29 +2107,47 @@
 	  };
 
 	  // --- Water plane ---
-	  // DOCUMENTED SIMPLIFICATION (see waterFS comment above): a plane at the scene's
-	  // global water_level, sized to the terrain's world bounds. Does NOT trace an
-	  // actual river's path (Terrain_generateRiver/River_WalkPath not ported this
-	  // session).
-	  if (currentTerrainCode.waterLevel !== null && document.getElementById('showWaterToggle').checked) {
-              const waterPositions = new Float32Array(width * height * 3);
-              const depths = new Float32Array(width * height);
-              for (let row = 0; row < height; row++) {
-		  for (let col = 0; col < width; col++) {
-		      const i = vIndex(col, row);
-		      const p = i * 3;
-		      waterPositions[p]     = col * cellSize;
-		      waterPositions[p + 1] = currentTerrainCode.waterLevel;
-		      waterPositions[p + 2] = row * cellSize;
-		      depths[i] = Math.max(0, currentTerrainCode.waterLevel - heights[i]);
+	  // [Ghidra: Terrain_BuildRiverRenderMesh @ 0x0056ba20, live TraceRmi debugging session
+	  // 2026-08-17] CORRECTED: this file previously rendered a plane at the scene's
+	  // scenes.txt "water_level" token, sized to the terrain's world bounds - but every
+	  // sampled scene (including this one) carries the identical value -100.0 for that
+	  // token, which is far below any terrain height and so never renders (see
+	  // OPEN_QUESTIONS.md's now-resolved entry). Ghidra confirms the real engine does not
+	  // use that token for water at all: `Terrain_BuildRiverRenderMesh` gates water
+	  // geometry per-FACE on a fixed constant, `aVertexGrid[corner].z <= -0.3` for any of
+	  // the face's corners, and places the water vertex at a flat Y of that SAME -0.3
+	  // constant (confirmed live: Arcole's actual combined heights dip to -3.0 across 3793
+	  // of 42025 vertices - a real carved river channel, not something the old code could
+	  // ever have shown). Ported as: water renders only over faces meeting that gate, at a
+	  // flat Y=-0.3, using buildWaterIndices() (same triangulation/winding as the terrain,
+	  // filtered to the water-touching subset). NOT a full byte-exact port of this
+	  // function's separate bank-material-blend branch (which computes a river/bank
+	  // texture-atlas index, not a height, for interior tiles with steep-enough normals -
+	  // does not affect the Y position, only shading detail not modeled by this file's
+	  // simplified water shader).
+	  if (document.getElementById('showWaterToggle').checked) {
+              const WATER_LEVEL = -0.3;
+              const waterIndices = buildWaterIndices(gridW, gridH, width, heights);
+              if (waterIndices.length > 0) {
+		  const waterPositions = new Float32Array(width * height * 3);
+		  const depths = new Float32Array(width * height);
+		  for (let row = 0; row < height; row++) {
+		      for (let col = 0; col < width; col++) {
+			  const i = vIndex(col, row);
+			  const p = i * 3;
+			  waterPositions[p]     = col * cellSize;
+			  waterPositions[p + 1] = WATER_LEVEL;
+			  waterPositions[p + 2] = row * cellSize;
+			  depths[i] = Math.max(0, WATER_LEVEL - heights[i]);
+		      }
 		  }
-              }
-              waterMeshGL = {
-		  posBuf: makeBuffer(gl.ARRAY_BUFFER, waterPositions),
-		  depthBuf: makeBuffer(gl.ARRAY_BUFFER, depths),
-		  idxBuf: makeBuffer(gl.ELEMENT_ARRAY_BUFFER, sharedIndices),
-		  idxCount: sharedIndices.length,
-              };
+		  waterMeshGL = {
+		      posBuf: makeBuffer(gl.ARRAY_BUFFER, waterPositions),
+		      depthBuf: makeBuffer(gl.ARRAY_BUFFER, depths),
+		      idxBuf: makeBuffer(gl.ELEMENT_ARRAY_BUFFER, waterIndices),
+		      idxCount: waterIndices.length,
+		  };
+	      }
 	  }
       }
 
@@ -2270,14 +2365,29 @@
         const view = viewMatrix();
         const viewProj = mat4Multiply(proj, view);
 
+        // Ghidra live-debug ground truth (2026-08-17, breakpoint right after Terrain_Build's
+        // Light_AccumulateDirectionAndColorAtPoint call, reading Terrain+0xf93098.. via a running
+        // multiplayer match): Terrain.aLightDirectionCached/aAmbientLightColor/aDirectLightColor,
+        // cross-confirmed against Terrain_ComputeVertexSunVisibility_LightmapTexelBake's (0x00505870)
+        // disassembly-verified formula `(ambient*1.5 + diff*shadow*direct) * albedo` - this shader's
+        // existing formula shape was already exactly right, only the 3 constants below were guesses.
+        // aLightDirectionCached read as game-space (X, Y=0.0002, Z=-0.3285) - remapped to this
+        // renderer's Y-up convention as (X, Z, Y) same as every other position/direction this
+        // session. flDirectLightIntensity (=4.0 in the live read) is confirmed UNUSED by that
+        // formula - not applied here. Not yet confirmed whether these 3 values are per-map or a
+        // fixed multiplayer-wide lighting rig (see OPEN_QUESTIONS.md) - captured from one live scene.
+        const LIGHT_DIR = [0.9457, -0.3285, 0.0002];
+        const LIGHT_COLOR = [0.4557, 0.4303, 0.3796]; // aDirectLightColor
+        const AMBIENT_COLOR = [0.1775, 0.1976, 0.2935]; // aAmbientLightColor
+
         if (terrainMeshGL) {
           gl.useProgram(terrainProgram);
           gl.uniformMatrix4fv(terrainLoc.uViewProj, false, viewProj);
           gl.uniform1f(terrainLoc.uUseTextures, useTexturesFlag ? 1.0 : 0.0);
           gl.uniform1f(terrainLoc.uTexScale, 12.0); // world units per texture tile - reasonable default, not Ghidra-derived
-          gl.uniform3f(terrainLoc.uLightDir, 0.4, -0.8, 0.3);
-          gl.uniform3f(terrainLoc.uLightColor, 1.0, 0.98, 0.9);
-          gl.uniform3f(terrainLoc.uAmbientColor, 0.45, 0.45, 0.5);
+          gl.uniform3f(terrainLoc.uLightDir, ...LIGHT_DIR);
+          gl.uniform3f(terrainLoc.uLightColor, ...LIGHT_COLOR);
+          gl.uniform3f(terrainLoc.uAmbientColor, ...AMBIENT_COLOR);
 
           for (let slot = 0; slot < 8; slot++) {
             const layerIdx = activeLayerIndices[slot];
@@ -2317,9 +2427,9 @@
         if (entityMeshGroups.length && showEntitiesFlag) {
           gl.useProgram(entityProgram);
           gl.uniformMatrix4fv(entityLoc.uViewProj, false, viewProj);
-          gl.uniform3f(entityLoc.uLightDir, 0.4, -0.8, 0.3);
-          gl.uniform3f(entityLoc.uLightColor, 1.0, 0.98, 0.9);
-          gl.uniform3f(entityLoc.uAmbientColor, 0.45, 0.45, 0.5);
+          gl.uniform3f(entityLoc.uLightDir, ...LIGHT_DIR);
+          gl.uniform3f(entityLoc.uLightColor, ...LIGHT_COLOR);
+          gl.uniform3f(entityLoc.uAmbientColor, ...AMBIENT_COLOR);
           for (const group of entityMeshGroups) {
             gl.activeTexture(gl.TEXTURE0);
             gl.bindTexture(gl.TEXTURE_2D, group.tex);
@@ -2362,8 +2472,20 @@
           gl.enable(gl.BLEND);
           gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
           gl.depthMask(false);
+          // LEQUAL instead of the default LESS: the water plane sits at the same fixed
+          // Y (-0.3) as the terrain's own water-gate threshold (Terrain_BuildRiverRenderMesh,
+          // 0x0056ba20), so shoreline terrain vertices are frequently near-coplanar with the
+          // water surface. Ghidra was checked for an engine-side Z-fighting mitigation
+          // (D3DRS_DEPTHBIAS/D3DRS_SLOPESCALEDEPTHBIAS at FUN_0042df50) but that render state
+          // is scoped entirely to shadow-map rendering and is reset to 0 before the normal
+          // color draw - no material- or water-specific depth-bias/z-func override exists in
+          // the traced draw chain (FUN_0042d3b0). Absent an engine-side mechanism to replicate,
+          // LEQUAL is the standard mitigation: water is drawn after terrain, so exact-tie depths
+          // deterministically resolve in the later draw's favor instead of flickering per-pixel.
+          gl.depthFunc(gl.LEQUAL);
           gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, waterMeshGL.idxBuf);
           gl.drawElements(gl.TRIANGLES, waterMeshGL.idxCount, gl.UNSIGNED_SHORT, 0);
+          gl.depthFunc(gl.LESS);
           gl.depthMask(true);
           gl.disable(gl.BLEND);
         }

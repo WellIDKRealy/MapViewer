@@ -1068,7 +1068,12 @@
       // is removed - the region-base material's own slope-fade term, baked into vWeights0.x by
       // computeVertexLayerWeights(), is what the real engine uses for that visual effect).
       const terrainFS = `
-        precision mediump float;
+        // highp, not mediump: mediump in GLSL ES is only guaranteed ~10 mantissa bits (some
+        // GPUs implement it as literal fp16) - at world-space coordinates in the hundreds/
+        // low-thousands (this terrain's scale), that's well under 1-unit resolution, causing
+        // visible vertex/depth swimming and water clipping as the camera moves away from the
+        // origin. highp is effectively universal on desktop WebGL1 implementations.
+        precision highp float;
         varying vec3 vNormal;
         varying vec3 vWorldPos;
         varying float vShadow;
@@ -1111,20 +1116,20 @@
         }
       `;
 
-      // Water: NOT a byte-exact port of the real river/water mesh (Terrain_generateRiver /
-      // Terrain_BuildRiverRenderMesh @0x0056ba20 / Terrain_BuildRiverChunkSubMesh - traced
-      // this session, see OPEN_QUESTIONS.md/COMPLETED_WORK.md - that requires walking
-      // River_WalkPath's carved channel, out of scope). This IS informed by what those
-      // functions confirmed about how the engine treats water:
-      //  - rglMesh_BlendVerticesTowardWaterLevel (0x0056c270) blends shoreline vertices
-      //    toward the water surface based on a depth-derived factor - reproduced here as a
-      //    per-vertex depth-based color/alpha ramp (uses the REAL loaded heightmap, not a
-      //    guess: depth = waterLevel - actualTerrainHeightAtThatXZ).
-      //  - Terrain_BuildRiverRenderMesh treats aVertexGrid[].z <= -0.3 as "underwater".
-      //  - A believable fresnel term + gentle animated ripple are added on top as a
-      //    genuine rendering improvement over the prior flat semi-transparent plane -
-      //    procedural, not sampled from any traced engine shader (the D3D fixed-function/
-      //    shader-constant water appearance itself was not decompiled this session).
+      // Water: uses the REAL game assets, confirmed via materials.brf (2026-08-17) - the
+      // "river" material (the one Terrain_BuildRiverRenderMesh's finalize step names its
+      // mesh material, per its confirmed `MaterialTable_FindByName(&DAT_0086bbf0, "river")`
+      // call) resolves to shader="water_shader_high", diffuse texture="river" (river.dds,
+      // 512x512 DXT1), bump="waterbump" (an ANIMATED 20-frame normal map,
+      // waterbump_0..19.dds, 256x256 DXT5 each), specular=10.0, specular tint=(3,3,3).
+      // Sampled+used directly below instead of the old fully-invented flat shallow/deep
+      // color gradient. NOT a byte-exact port of "water_shader_high"'s actual HLSL (that
+      // compiled shader itself was not extracted/disassembled this session) - the
+      // diffuse/bump textures and specular constants are real and confirmed; the fresnel
+      // mix, vertex ripple, and depth-alpha ramp around them are a physically-reasonable
+      // combination, not a traced formula. Still not a byte-exact port of the real river
+      // MESH shape either (Terrain_generateRiver/River_WalkPath's carved channel - out of
+      // scope, see OPEN_QUESTIONS.md) - this is a flat plane at the confirmed Y=-0.3.
       const waterVS = `
         attribute vec3 aPosition;
         attribute float aDepth;
@@ -1141,25 +1146,52 @@
         }
       `;
       const waterFS = `
-        precision mediump float;
+        // highp, not mediump: mediump in GLSL ES is only guaranteed ~10 mantissa bits (some
+        // GPUs implement it as literal fp16) - at world-space coordinates in the hundreds/
+        // low-thousands (this terrain's scale), that's well under 1-unit resolution, causing
+        // visible vertex/depth swimming and water clipping as the camera moves away from the
+        // origin. highp is effectively universal on desktop WebGL1 implementations.
+        precision highp float;
         varying vec3 vWorldPos;
         varying float vDepth;
         uniform vec3 uCameraPos;
         uniform highp float uTime; // must match the vertex shader's default (highp) precision for this uniform - WebGL1 link error otherwise
-        uniform vec3 uShallowColor;
-        uniform vec3 uDeepColor;
         uniform vec3 uSkyColor;
+        uniform sampler2D uDiffuseTex; // river.dds
+        uniform sampler2D uBumpTex;    // current waterbump_N.dds animation frame
+        uniform vec3 uLightDir;
+        uniform vec3 uLightColor;
         void main() {
+          // UV tiling scale not confirmed (not present in the material record) - reasonable
+          // default matching the ground-texture tiling already used elsewhere in this file.
+          vec2 uv = vWorldPos.xz * 0.15;
+          vec3 diffuseTex = texture2D(uDiffuseTex, uv).rgb;
+
+          // Bump map decoded as a standard tangent-space normal (RGB -> XYZ, *2-1); the
+          // water plane is flat and horizontal, so tangent space ~= world space here.
+          // Scrolled at a different rate/scale than the diffuse UV for a believable flow.
+          vec2 bumpUV = vWorldPos.xz * 0.3 + vec2(uTime * 0.02, uTime * 0.015);
+          vec3 bumpSample = texture2D(uBumpTex, bumpUV).rgb;
+          vec3 nTS = normalize(bumpSample * 2.0 - 1.0);
+          vec3 n = normalize(vec3(nTS.x, 1.0, nTS.z));
+
           vec3 viewDir = normalize(uCameraPos - vWorldPos);
-          float nx = sin(vWorldPos.x * 0.4 + uTime * 1.1) * 0.15 + sin(vWorldPos.z * 0.7 - uTime * 0.6) * 0.10;
-          float nz = cos(vWorldPos.z * 0.4 - uTime * 1.3) * 0.15 + cos(vWorldPos.x * 0.6 + uTime * 0.5) * 0.10;
-          vec3 n = normalize(vec3(nx, 1.0, nz));
           float fresnel = pow(1.0 - max(dot(viewDir, n), 0.0), 4.0);
+
+          // Confirmed material constants (materials.brf "river": specular=10.0, tint=(3,3,3)).
+          // The (3,3,3) tint is an HDR-range value from the real tonemapped pipeline; applying
+          // it as a literal multiplier in this LDR renderer washed out the whole surface (no
+          // tonemap stage to compress it back down), so it's scaled well below 1.0 here -
+          // keeps the confirmed exponent (10.0) and light-color tint direction, not the raw
+          // HDR magnitude, which this renderer has no principled way to reproduce.
+          vec3 halfDir = normalize(viewDir - uLightDir);
+          float specAngle = max(dot(n, halfDir), 0.0);
+          vec3 specular = uLightColor * (pow(specAngle, 10.0) * 0.35);
+
           float depthFactor = clamp(vDepth / 6.0, 0.0, 1.0);
-          vec3 waterColor = mix(uShallowColor, uDeepColor, depthFactor);
-          vec3 color = mix(waterColor, uSkyColor, fresnel * 0.6);
+          vec3 color = mix(diffuseTex, uSkyColor, fresnel * 0.5) + specular;
           float alpha = mix(0.55, 0.92, depthFactor * 0.6 + fresnel * 0.4);
-          gl_FragColor = vec4(color, alpha);
+          gl_FragColor = vec4(clamp(color, 0.0, 1.0), alpha);
         }
       `;
 
@@ -1185,10 +1217,21 @@
         uViewProj: gl.getUniformLocation(waterProgram, 'uViewProj'),
         uTime: gl.getUniformLocation(waterProgram, 'uTime'),
         uCameraPos: gl.getUniformLocation(waterProgram, 'uCameraPos'),
-        uShallowColor: gl.getUniformLocation(waterProgram, 'uShallowColor'),
-        uDeepColor: gl.getUniformLocation(waterProgram, 'uDeepColor'),
         uSkyColor: gl.getUniformLocation(waterProgram, 'uSkyColor'),
+        uDiffuseTex: gl.getUniformLocation(waterProgram, 'uDiffuseTex'),
+        uBumpTex: gl.getUniformLocation(waterProgram, 'uBumpTex'),
+        uLightDir: gl.getUniformLocation(waterProgram, 'uLightDir'),
+        uLightColor: gl.getUniformLocation(waterProgram, 'uLightColor'),
       };
+      // Real water textures (materials.brf "river": diffuse="river", bump="waterbump" - a
+      // 20-frame animated normal map, waterbump_0..19.dds). Loaded the same
+      // fallback-then-upgrade way as groundTextures above.
+      const riverDiffuseTex = loadServerTexture('river', [0.15, 0.3, 0.4], true);
+      const WATER_BUMP_FRAME_COUNT = 20;
+      const waterBumpTextures = [];
+      for (let i = 0; i < WATER_BUMP_FRAME_COUNT; i++) {
+        waterBumpTextures.push(loadServerTexture('waterbump_' + i, [0.5, 0.5, 1.0], true));
+      }
 
       // Entity meshes (trees/bushes/props) - real 3D geometry resolved client-side via
       // WarbandAssets.getMeshData() (see fetchMeshGeometry above), pre-transformed
@@ -1210,7 +1253,12 @@
         }
       `;
       const meshFS = `
-        precision mediump float;
+        // highp, not mediump: mediump in GLSL ES is only guaranteed ~10 mantissa bits (some
+        // GPUs implement it as literal fp16) - at world-space coordinates in the hundreds/
+        // low-thousands (this terrain's scale), that's well under 1-unit resolution, causing
+        // visible vertex/depth swimming and water clipping as the camera moves away from the
+        // origin. highp is effectively universal on desktop WebGL1 implementations.
+        precision highp float;
         varying vec3 vNormal;
         varying vec2 vUV;
         uniform sampler2D uTex;
@@ -1342,6 +1390,7 @@
             idxBuf: makeBuffer(gl.ELEMENT_ARRAY_BUFFER, idxArr),
             idxCount: group.indices.length,
             idxType: group.indices.length > 65535 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT,
+            vertCount: group.positions.length / 3,
           });
         }
       }
@@ -2361,7 +2410,14 @@
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
         const aspect = canvas.width / Math.max(1, canvas.height);
-        const proj = mat4Perspective(75 * Math.PI / 180, aspect, 0.1, 3000);
+        // near=0.1/far=3000 (ratio 30000:1) starved depth-buffer precision at distance - a
+        // standard (non-reversed) perspective projection concentrates almost all its usable
+        // depth range within roughly the first 10x the near plane, so far-distance precision
+        // is governed mainly by the near/far RATIO, not far alone. Nothing in this viewer is
+        // ever rendered closer than ~1 unit to the camera (terrain cellSize=5), so near=1.0 is
+        // safe; far=2500 still comfortably covers this project's terrain sizes (~1000-2000
+        // units) with margin. Ratio drops to 2500:1, a 12x improvement.
+        const proj = mat4Perspective(75 * Math.PI / 180, aspect, 1.0, 2500);
         const view = viewMatrix();
         const viewProj = mat4Multiply(proj, view);
 
@@ -2430,7 +2486,23 @@
           gl.uniform3f(entityLoc.uLightDir, ...LIGHT_DIR);
           gl.uniform3f(entityLoc.uLightColor, ...LIGHT_COLOR);
           gl.uniform3f(entityLoc.uAmbientColor, ...AMBIENT_COLOR);
+          gl.enable(gl.POLYGON_OFFSET_FILL);
           for (const group of entityMeshGroups) {
+            // Coplanar-decal Z-fighting fix: some compiled meshes (e.g.
+            // spr_mm_build_church_tower's small "planks_6"/"mm_stuco" trim pieces, confirmed
+            // via bounding-box overlap analysis to share nearly identical XYZ footprints with
+            // each other - a wood-frame overlay flush against the stucco wall it's mounted on)
+            // have multiple pieces sitting almost exactly coplanar. Not a Ghidra-confirmed
+            // mechanism (the real per-mesh vertex data may bake in a tiny intentional offset
+            // that didn't survive/wasn't captured by this project's .brf geometry port) - this
+            // is the standard, well-established graphics technique for exactly this situation:
+            // smaller/simpler pieces (by vertex count - a proxy for "detail/trim layer" vs
+            // "base structural surface") get pushed slightly toward the camera so depth ties
+            // resolve deterministically instead of flickering. Large structural pieces get
+            // ~zero offset.
+            const offsetUnits = -Math.max(0, Math.log2(1000 / Math.max(1, group.vertCount)));
+            gl.polygonOffset(0, offsetUnits);
+
             gl.activeTexture(gl.TEXTURE0);
             gl.bindTexture(gl.TEXTURE_2D, group.tex);
             gl.uniform1i(entityLoc.uTex, 0);
@@ -2450,6 +2522,7 @@
             gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, group.idxBuf);
             gl.drawElements(gl.TRIANGLES, group.idxCount, group.idxType, 0);
           }
+          gl.disable(gl.POLYGON_OFFSET_FILL);
         }
 
         if (waterMeshGL) {
@@ -2457,9 +2530,20 @@
           gl.uniformMatrix4fv(waterLoc.uViewProj, false, viewProj);
           gl.uniform1f(waterLoc.uTime, elapsed);
           gl.uniform3f(waterLoc.uCameraPos, camera.pos[0], camera.pos[1], camera.pos[2]);
-          gl.uniform3f(waterLoc.uShallowColor, 0.35, 0.62, 0.63);
-          gl.uniform3f(waterLoc.uDeepColor, 0.05, 0.18, 0.32);
           gl.uniform3f(waterLoc.uSkyColor, 0x87 / 255, 0xCE / 255, 0xEB / 255);
+          gl.uniform3f(waterLoc.uLightDir, ...LIGHT_DIR);
+          gl.uniform3f(waterLoc.uLightColor, ...LIGHT_COLOR);
+
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, riverDiffuseTex);
+          gl.uniform1i(waterLoc.uDiffuseTex, 0);
+          // 8 frames/sec cycle through the real 20-frame waterbump animation - not a
+          // confirmed real framerate (not present in the material record), a reasonable
+          // default matching the confirmed 20-frame count.
+          const bumpFrame = Math.floor(elapsed * 8) % WATER_BUMP_FRAME_COUNT;
+          gl.activeTexture(gl.TEXTURE1);
+          gl.bindTexture(gl.TEXTURE_2D, waterBumpTextures[bumpFrame]);
+          gl.uniform1i(waterLoc.uBumpTex, 1);
 
           gl.bindBuffer(gl.ARRAY_BUFFER, waterMeshGL.posBuf);
           gl.enableVertexAttribArray(waterLoc.aPosition);
